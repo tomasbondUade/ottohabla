@@ -37,6 +37,7 @@ STATE = {
     "last_user": "",
     "last_answer": "",
     "logs": [],
+    "robot_host": os.getenv("OTTOHABLA_G1_HOST", "unitree@192.168.137.196"),
 }
 EVENT_CONTEXT = (
     "Sos Otto Habla, robot anfitrión del evento 'El Nuevo Mapa del Capital' en UADE, "
@@ -120,7 +121,7 @@ def send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> No
 
 
 def speak(text: str, volume: str) -> None:
-    speak_with_remote_piper(text, DEFAULT_G1_HOST, DEFAULT_G1_KEY, DEFAULT_OTTO_SAY, volume)
+    speak_with_remote_piper(text, robot_host(), DEFAULT_G1_KEY, DEFAULT_OTTO_SAY, volume)
 
 
 def ask_and_speak(prompt: str, volume: str, instructions: str, model: str) -> str:
@@ -129,6 +130,11 @@ def ask_and_speak(prompt: str, volume: str, instructions: str, model: str) -> st
     log(f"GPT => {answer}")
     speak(answer, volume)
     return answer
+
+
+def robot_host() -> str:
+    with LOCK:
+        return str(STATE.get("robot_host") or "unitree@192.168.137.196")
 
 
 def ssh_status() -> tuple[bool, str]:
@@ -144,7 +150,7 @@ def ssh_status() -> tuple[bool, str]:
                 "ConnectTimeout=4",
                 "-o",
                 "StrictHostKeyChecking=no",
-                DEFAULT_G1_HOST,
+                robot_host(),
                 "echo robot-ok",
             ],
             check=True,
@@ -162,6 +168,7 @@ def run_checked(cmd: list[str], timeout: float | None = None) -> subprocess.Comp
 
 
 def scp_to_robot(local_path: Path, remote_path: str) -> None:
+    host = robot_host()
     run_checked(
         [
             "scp",
@@ -172,13 +179,14 @@ def scp_to_robot(local_path: Path, remote_path: str) -> None:
             "-o",
             "StrictHostKeyChecking=no",
             str(local_path),
-            f"{DEFAULT_G1_HOST}:{remote_path}",
+            f"{host}:{remote_path}",
         ],
         timeout=20,
     )
 
 
 def scp_from_robot(remote_path: str, local_path: Path) -> None:
+    host = robot_host()
     run_checked(
         [
             "scp",
@@ -188,7 +196,7 @@ def scp_from_robot(remote_path: str, local_path: Path) -> None:
             "BatchMode=yes",
             "-o",
             "StrictHostKeyChecking=no",
-            f"{DEFAULT_G1_HOST}:{remote_path}",
+            f"{host}:{remote_path}",
             str(local_path),
         ],
         timeout=30,
@@ -273,7 +281,7 @@ def start_mic(min_confidence: float = 0.55) -> None:
     scp_to_robot(ROOT / "scripts" / "remote_record_g1_mic.py", remote_script)
     run_checked(
         ssh_command(
-            DEFAULT_G1_HOST,
+            robot_host(),
             DEFAULT_G1_KEY,
             f"pkill -f {remote_script} || true; chmod +x {remote_script}",
         ),
@@ -281,7 +289,7 @@ def start_mic(min_confidence: float = 0.55) -> None:
     )
     remote_command = f"exec python3 {remote_script} {remote_wav}"
     proc = subprocess.Popen(
-        ssh_command(DEFAULT_G1_HOST, DEFAULT_G1_KEY, remote_command),
+        ssh_command(robot_host(), DEFAULT_G1_KEY, remote_command),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -319,7 +327,7 @@ def stop_mic() -> str:
         except subprocess.TimeoutExpired:
             proc.kill()
     run_checked(
-        ssh_command(DEFAULT_G1_HOST, DEFAULT_G1_KEY, "pkill -f /tmp/ottohabla_record_mic.py || true"),
+        ssh_command(robot_host(), DEFAULT_G1_KEY, "pkill -f /tmp/ottohabla_record_mic.py || true"),
         timeout=10,
     )
     if isinstance(thread, threading.Thread):
@@ -474,8 +482,11 @@ HTML = r"""<!doctype html>
       <h2>Conversación</h2>
       <label for="apiKey">OpenAI API key</label>
       <input id="apiKey" type="password" placeholder="sk-proj-..." autocomplete="off" />
+      <label for="robotHost">Robot SSH host</label>
+      <input id="robotHost" value="unitree@192.168.137.196" />
       <div class="actions">
         <button class="secondary" id="saveKey">Usar API key</button>
+        <button class="secondary" id="saveHost">Usar host</button>
         <button class="secondary" id="checkRobot">Probar robot</button>
       </div>
 
@@ -521,7 +532,7 @@ HTML = r"""<!doctype html>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
-    const controls = ["saveKey", "checkRobot", "sendText", "micOpen", "micClose", "sayTest"];
+    const controls = ["saveKey", "saveHost", "checkRobot", "sendText", "micOpen", "micClose", "sayTest"];
 
     function setBusy(busy) {
       for (const id of controls) $(id).disabled = busy;
@@ -557,6 +568,7 @@ HTML = r"""<!doctype html>
       $("apiPill").className = data.api_key_set ? "pill ok" : "pill bad";
       $("robotPill").textContent = data.robot_ok ? "Robot conectado" : "Robot sin probar";
       $("robotPill").className = data.robot_ok ? "pill ok" : "pill";
+      if (data.robot_host && $("robotHost").value !== data.robot_host) $("robotHost").value = data.robot_host;
       $("micPill").textContent = data.mic_active ? "Mic abierto" : "Mic cerrado";
       $("micPill").className = data.mic_active ? "pill ok" : "pill";
       $("busyPill").textContent = data.busy ? "Trabajando" : "Listo";
@@ -570,6 +582,7 @@ HTML = r"""<!doctype html>
       await api("/api/key", { api_key: $("apiKey").value });
       $("apiKey").value = "";
     };
+    $("saveHost").onclick = async () => api("/api/host", { robot_host: $("robotHost").value });
     $("checkRobot").onclick = async () => api("/api/check-robot");
     $("sayTest").onclick = async () => api("/api/say", {
       text: "Hola, soy Otto. La voz está lista.",
@@ -640,6 +653,19 @@ class Handler(BaseHTTPRequestHandler):
                     STATE["api_key_set"] = True
                 log("API key cargada en memoria local.")
                 send_json(self, 200, {"ok": True})
+                return
+
+            if parsed.path == "/api/host":
+                host = (payload.get("robot_host") or "").strip()
+                if not host:
+                    raise ValueError("Host vacío.")
+                if "@" not in host:
+                    host = f"unitree@{host}"
+                with LOCK:
+                    STATE["robot_host"] = host
+                    STATE["robot_ok"] = False
+                log(f"Robot host configurado: {host}")
+                send_json(self, 200, {"ok": True, "robot_host": host})
                 return
 
             if parsed.path == "/api/check-robot":
@@ -719,7 +745,7 @@ class Handler(BaseHTTPRequestHandler):
                 class Args:
                     model = DEFAULT_MODEL
                     instructions = payload.get("instructions") or EVENT_CONTEXT
-                    g1_host = DEFAULT_G1_HOST
+                    g1_host = robot_host()
                     g1_identity_file = DEFAULT_G1_KEY
                     asr_bin = "~/Desktop/teo_Ottoguide_IA/ottoguide-ia/src/otto_audio/cpp/build/asr_test"
                     asr_interface = "eth0"
