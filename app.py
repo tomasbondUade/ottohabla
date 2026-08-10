@@ -6,17 +6,20 @@ import html
 import mimetypes
 import tempfile
 import uuid
+import base64
 import subprocess
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import wave
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
 
 ROOT = Path(__file__).resolve().parent
 SCRIPTS = ROOT / "scripts"
+API_KEY_FILE = ROOT / ".ottohabla_api_key"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
@@ -31,13 +34,22 @@ from ask_gpt_and_speak import (
 from listen_g1_gpt import extract_asr_text, listen_once, ssh_command
 
 
+def load_api_key() -> bool:
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not key and API_KEY_FILE.exists():
+        key = API_KEY_FILE.read_text(encoding="utf-8").strip()
+        if key:
+            os.environ["OPENAI_API_KEY"] = key
+    return bool(key)
+
+
 STATE = {
-    "api_key_set": bool(os.getenv("OPENAI_API_KEY")),
+    "api_key_set": load_api_key(),
     "busy": False,
     "last_user": "",
     "last_answer": "",
     "logs": [],
-    "robot_host": os.getenv("OTTOHABLA_G1_HOST", "unitree@192.168.137.196"),
+    "robot_host": os.getenv("OTTOHABLA_G1_HOST", "unitree@192.168.123.164"),
 }
 EVENT_CONTEXT = (
     "Sos Otto Habla, robot anfitrión del evento 'El Nuevo Mapa del Capital' en UADE, "
@@ -47,7 +59,8 @@ EVENT_CONTEXT = (
     "La audiencia incluye empresarios, desarrolladores inmobiliarios, inversionistas, "
     "brokers, arquitectos, ejecutivos, autoridades académicas y medios. "
     "Respondé en español rioplatense, con tono de anfitrión inteligente, sofisticado, "
-    "humor elegante y frases breves pensadas para decir en voz alta."
+    "humor elegante y frases breves pensadas para decir en voz alta. "
+    "No uses Markdown, asteriscos, listas ni texto con formato."
 )
 PERSON_PHRASES = {
     "edgardo": {
@@ -87,6 +100,16 @@ MIC = {
     "texts": [],
     "remote_wav": "",
 }
+PC_MIC = {
+    "active": False,
+    "stream": None,
+    "proc": None,
+    "wav_path": None,
+    "frames": bytearray(),
+    "sample_rate": 16000,
+    "channels": 1,
+    "device": None,
+}
 LOCK = threading.Lock()
 
 
@@ -120,6 +143,24 @@ def send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> No
     handler.wfile.write(body)
 
 
+def set_api_key(key: str, save: bool = True) -> None:
+    key = key.strip()
+    if not key:
+        raise ValueError("Pegá una API key primero.")
+    os.environ["OPENAI_API_KEY"] = key
+    if save:
+        API_KEY_FILE.write_text(key, encoding="utf-8")
+    with LOCK:
+        STATE["api_key_set"] = True
+
+
+def accept_api_key_from_payload(payload: dict) -> None:
+    key = (payload.get("api_key") or "").strip()
+    if key and key != os.getenv("OPENAI_API_KEY", ""):
+        set_api_key(key)
+        log("API key cargada desde el formulario.")
+
+
 def speak(text: str, volume: str) -> None:
     speak_with_remote_piper(text, robot_host(), DEFAULT_G1_KEY, DEFAULT_OTTO_SAY, volume)
 
@@ -134,7 +175,7 @@ def ask_and_speak(prompt: str, volume: str, instructions: str, model: str) -> st
 
 def robot_host() -> str:
     with LOCK:
-        return str(STATE.get("robot_host") or "unitree@192.168.137.196")
+        return str(STATE.get("robot_host") or "unitree@192.168.123.164")
 
 
 def ssh_status() -> tuple[bool, str]:
@@ -249,6 +290,92 @@ def transcribe_audio(path: Path) -> str:
     if not text:
         raise RuntimeError("La transcripción volvió vacía.")
     return text
+
+
+def find_pc_mic_device() -> int | None:
+    import sounddevice as sd
+
+    devices = sd.query_devices()
+    for index, device in enumerate(devices):
+        name = str(device.get("name", "")).lower()
+        if device.get("max_input_channels", 0) > 0 and ("usb pnp" in name or "fifine" in name):
+            return index
+    default_input = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
+    return int(default_input) if default_input is not None and default_input >= 0 else None
+
+
+def start_pc_mic() -> None:
+    with LOCK:
+        if PC_MIC["active"]:
+            raise RuntimeError("El micrófono de la PC ya está abierto.")
+        PC_MIC["frames"] = bytearray()
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="ottohabla_pc_mic_live_"))
+    wav_path = temp_dir / "pc_mic.wav"
+    recorder_code = (
+        "import sys; "
+        f"sys.path.insert(0, {str(SCRIPTS)!r}); "
+        "import record_pc_mic; "
+        "sys.argv = ['record_pc_mic.py', sys.argv[1]]; "
+        "raise SystemExit(record_pc_mic.main())"
+    )
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            recorder_code,
+            str(wav_path),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    time.sleep(0.6)
+    if proc.poll() is not None:
+        output = proc.stdout.read() if proc.stdout else ""
+        raise RuntimeError(f"No pude abrir el micrófono de la PC: {output.strip()}")
+
+    with LOCK:
+        PC_MIC["active"] = True
+        PC_MIC["proc"] = proc
+        PC_MIC["wav_path"] = wav_path
+    log("Micrófono PC abierto con grabador local.")
+
+
+def stop_pc_mic() -> Path:
+    with LOCK:
+        if not PC_MIC["active"]:
+            raise RuntimeError("El micrófono de la PC no está abierto.")
+        proc = PC_MIC["proc"]
+        wav_path = PC_MIC["wav_path"]
+        PC_MIC["active"] = False
+        PC_MIC["proc"] = None
+        PC_MIC["wav_path"] = None
+        PC_MIC["frames"] = bytearray()
+
+    if isinstance(proc, subprocess.Popen):
+        if proc.stdin:
+            proc.stdin.write("stop\n")
+            proc.stdin.flush()
+        try:
+            stdout, _stderr = proc.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, _stderr = proc.communicate(timeout=1)
+        if stdout:
+            for line in stdout.splitlines():
+                log(line)
+
+    if not isinstance(wav_path, Path) or not wav_path.exists():
+        raise RuntimeError("No se generó el WAV del micrófono.")
+    if wav_path.stat().st_size < 4000:
+        raise RuntimeError("El audio grabado es demasiado corto.")
+
+    log(f"Micrófono PC cerrado. WAV: {wav_path} ({wav_path.stat().st_size} bytes).")
+    return wav_path
 
 
 def _mic_reader(proc: subprocess.Popen[str], min_confidence: float) -> None:
@@ -483,7 +610,7 @@ HTML = r"""<!doctype html>
       <label for="apiKey">OpenAI API key</label>
       <input id="apiKey" type="password" placeholder="sk-proj-..." autocomplete="off" />
       <label for="robotHost">Robot SSH host</label>
-      <input id="robotHost" value="unitree@192.168.137.196" />
+      <input id="robotHost" value="unitree@192.168.123.164" />
       <div class="actions">
         <button class="secondary" id="saveKey">Usar API key</button>
         <button class="secondary" id="saveHost">Usar host</button>
@@ -514,9 +641,13 @@ HTML = r"""<!doctype html>
           </select>
         </div>
       </div>
+      <label for="micDevice">Micrófono USB de esta PC</label>
+      <select id="micDevice">
+        <option value="">Predeterminado del navegador</option>
+      </select>
       <div class="actions">
         <button id="sendText">Enviar texto y hablar</button>
-        <button id="micOpen">Abrir micrófono</button>
+        <button id="micOpen">Abrir micrófono USB</button>
         <button id="micClose">Cerrar y responder</button>
         <button class="secondary" id="sayTest">Probar voz</button>
       </div>
@@ -533,6 +664,15 @@ HTML = r"""<!doctype html>
   <script>
     const $ = (id) => document.getElementById(id);
     const controls = ["saveKey", "saveHost", "checkRobot", "sendText", "micOpen", "micClose", "sayTest"];
+    let mediaRecorder = null;
+    let micStream = null;
+    let browserMicOpen = false;
+    let audioContext = null;
+    let sourceNode = null;
+    let processorNode = null;
+    let pcmBuffers = [];
+    let pcmLength = 0;
+    let pcmSampleRate = 16000;
 
     function setBusy(busy) {
       for (const id of controls) $(id).disabled = busy;
@@ -543,6 +683,8 @@ HTML = r"""<!doctype html>
     async function api(path, payload = {}) {
       setBusy(true);
       try {
+        const typedKey = ($("apiKey")?.value || "").trim();
+        if (typedKey && path !== "/api/key") payload = { ...payload, api_key: typedKey };
         const res = await fetch(path, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -569,13 +711,126 @@ HTML = r"""<!doctype html>
       $("robotPill").textContent = data.robot_ok ? "Robot conectado" : "Robot sin probar";
       $("robotPill").className = data.robot_ok ? "pill ok" : "pill";
       if (data.robot_host && $("robotHost").value !== data.robot_host) $("robotHost").value = data.robot_host;
-      $("micPill").textContent = data.mic_active ? "Mic abierto" : "Mic cerrado";
-      $("micPill").className = data.mic_active ? "pill ok" : "pill";
+      const anyMicOpen = data.mic_active || data.pc_mic_active || browserMicOpen;
+      $("micPill").textContent = anyMicOpen ? "Mic PC abierto" : "Mic cerrado";
+      $("micPill").className = anyMicOpen ? "pill ok" : "pill";
       $("busyPill").textContent = data.busy ? "Trabajando" : "Listo";
       $("busyPill").className = data.busy ? "pill" : "pill ok";
       $("answer").textContent = data.last_answer || "";
       $("log").textContent = data.logs.join("\n");
       $("log").scrollTop = $("log").scrollHeight;
+    }
+
+    async function loadMicrophones() {
+      if (!navigator.mediaDevices?.enumerateDevices) return;
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const inputs = devices.filter(d => d.kind === "audioinput");
+        $("micDevice").innerHTML = '<option value="">Predeterminado del navegador</option>';
+        for (const d of inputs) {
+          const option = document.createElement("option");
+          option.value = d.deviceId;
+          option.textContent = d.label || `Micrófono ${$("micDevice").length}`;
+          if (/fifine|usb pnp|usb/i.test(option.textContent)) option.selected = true;
+          $("micDevice").appendChild(option);
+        }
+      } catch (err) {
+        console.warn(err);
+      }
+    }
+
+    async function openPcMic() {
+      const deviceId = $("micDevice").value;
+      const constraints = {
+        audio: deviceId ? { deviceId: { exact: deviceId }, echoCancellation: true, noiseSuppression: true } : true
+      };
+      micStream = await navigator.mediaDevices.getUserMedia(constraints);
+      await loadMicrophones();
+      audioContext = new AudioContext();
+      pcmSampleRate = audioContext.sampleRate;
+      pcmBuffers = [];
+      pcmLength = 0;
+      sourceNode = audioContext.createMediaStreamSource(micStream);
+      processorNode = audioContext.createScriptProcessor(4096, 1, 1);
+      processorNode.onaudioprocess = (event) => {
+        const input = event.inputBuffer.getChannelData(0);
+        const copy = new Float32Array(input.length);
+        copy.set(input);
+        pcmBuffers.push(copy);
+        pcmLength += copy.length;
+        event.outputBuffer.getChannelData(0).fill(0);
+      };
+      sourceNode.connect(processorNode);
+      processorNode.connect(audioContext.destination);
+      mediaRecorder = true;
+      browserMicOpen = true;
+      $("micPill").textContent = "Mic PC abierto";
+      $("micPill").className = "pill ok";
+    }
+
+    function encodeWav(buffers, length, sampleRate) {
+      const samples = new Float32Array(length);
+      let offset = 0;
+      for (const buffer of buffers) {
+        samples.set(buffer, offset);
+        offset += buffer.length;
+      }
+      const wav = new ArrayBuffer(44 + samples.length * 2);
+      const view = new DataView(wav);
+      const writeString = (pos, text) => {
+        for (let i = 0; i < text.length; i++) view.setUint8(pos + i, text.charCodeAt(i));
+      };
+      writeString(0, "RIFF");
+      view.setUint32(4, 36 + samples.length * 2, true);
+      writeString(8, "WAVE");
+      writeString(12, "fmt ");
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * 2, true);
+      view.setUint16(32, 2, true);
+      view.setUint16(34, 16, true);
+      writeString(36, "data");
+      view.setUint32(40, samples.length * 2, true);
+      let pos = 44;
+      for (let i = 0; i < samples.length; i++, pos += 2) {
+        const sample = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(pos, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+      }
+      return new Blob([view], { type: "audio/wav" });
+    }
+
+    async function closePcMicAndAnswer() {
+      if (!mediaRecorder) throw new Error("El micrófono de la PC no está abierto.");
+      processorNode.disconnect();
+      sourceNode?.disconnect();
+      if (micStream) micStream.getTracks().forEach(track => track.stop());
+      await audioContext.close();
+      micStream = null;
+      browserMicOpen = false;
+      mediaRecorder = null;
+      processorNode = null;
+      sourceNode = null;
+      audioContext = null;
+      const blob = encodeWav(pcmBuffers, pcmLength, pcmSampleRate);
+      pcmBuffers = [];
+      pcmLength = 0;
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+      const [, encoded] = String(dataUrl).split(",", 2);
+      $("micPill").textContent = "Transcribiendo";
+      $("micPill").className = "pill";
+      await api("/api/pc-audio", {
+        audio_base64: encoded,
+        mime_type: "audio/wav",
+        instructions: $("instructions").value,
+        volume: $("volume").value
+      });
     }
 
     $("saveKey").onclick = async () => {
@@ -599,13 +854,20 @@ HTML = r"""<!doctype html>
       instructions: $("instructions").value,
       volume: $("volume").value
     });
-    $("micOpen").onclick = async () => api("/api/mic-start");
-    $("micClose").onclick = async () => api("/api/mic-stop", {
-      instructions: $("instructions").value,
-      volume: $("volume").value
-    });
+    $("micOpen").onclick = async () => {
+      setBusy(true);
+      try {
+        await openPcMic();
+      } catch (err) {
+        $("answer").textContent = err.message;
+      } finally {
+        setBusy(false);
+      }
+    };
+    $("micClose").onclick = async () => closePcMicAndAnswer();
 
     refresh();
+    loadMicrophones();
     setInterval(refresh, 1500);
   </script>
 </body>
@@ -633,6 +895,7 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 payload = dict(STATE)
                 payload["mic_active"] = bool(MIC["active"])
+                payload["pc_mic_active"] = bool(PC_MIC["active"])
                 payload["mic_text"] = " ".join(MIC["texts"])
             payload["robot_ok"] = bool(STATE.get("robot_ok"))
             send_json(self, 200, payload)
@@ -648,12 +911,12 @@ class Handler(BaseHTTPRequestHandler):
                 key = (payload.get("api_key") or "").strip()
                 if not key:
                     raise ValueError("Pegá una API key primero.")
-                os.environ["OPENAI_API_KEY"] = key
-                with LOCK:
-                    STATE["api_key_set"] = True
+                set_api_key(key)
                 log("API key cargada en memoria local.")
                 send_json(self, 200, {"ok": True})
                 return
+
+            accept_api_key_from_payload(payload)
 
             if parsed.path == "/api/host":
                 host = (payload.get("robot_host") or "").strip()
@@ -724,10 +987,69 @@ class Handler(BaseHTTPRequestHandler):
                 send_json(self, 200, {"ok": True})
                 return
 
+            if parsed.path == "/api/pc-mic-start":
+                start_pc_mic()
+                send_json(self, 200, {"ok": True})
+                return
+
+            if parsed.path == "/api/pc-mic-stop":
+                set_busy(True)
+                wav_path = stop_pc_mic()
+                log("Transcribiendo micrófono PC...")
+                user_text = transcribe_audio(wav_path)
+                log(f"Mic PC => {user_text}")
+                answer = ask_and_speak(
+                    user_text,
+                    payload.get("volume") or "alto",
+                    payload.get("instructions") or EVENT_CONTEXT,
+                    DEFAULT_MODEL,
+                )
+                with LOCK:
+                    STATE["last_user"] = user_text
+                    STATE["last_answer"] = answer
+                send_json(self, 200, {"ok": True, "user_text": user_text, "answer": answer})
+                return
+
             if parsed.path == "/api/mic-stop":
                 set_busy(True)
                 user_text = stop_mic()
                 log(f"Mic final => {user_text}")
+                answer = ask_and_speak(
+                    user_text,
+                    payload.get("volume") or "alto",
+                    payload.get("instructions") or EVENT_CONTEXT,
+                    DEFAULT_MODEL,
+                )
+                with LOCK:
+                    STATE["last_user"] = user_text
+                    STATE["last_answer"] = answer
+                send_json(self, 200, {"ok": True, "user_text": user_text, "answer": answer})
+                return
+
+            if parsed.path == "/api/pc-audio":
+                set_busy(True)
+                audio_b64 = (payload.get("audio_base64") or "").strip()
+                if not audio_b64:
+                    raise ValueError("No llegó audio desde el navegador.")
+                mime_type = (payload.get("mime_type") or "audio/webm").split(";")[0]
+                ext = {
+                    "audio/webm": ".webm",
+                    "audio/wav": ".wav",
+                    "audio/mpeg": ".mp3",
+                    "audio/mp4": ".mp4",
+                    "audio/ogg": ".ogg",
+                }.get(mime_type, ".webm")
+                audio_bytes = base64.b64decode(audio_b64)
+                if len(audio_bytes) < 2000:
+                    raise ValueError("El audio grabado es demasiado corto.")
+
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    audio_path = Path(temp_dir) / f"pc_mic{ext}"
+                    audio_path.write_bytes(audio_bytes)
+                    log(f"Audio PC capturado: {len(audio_bytes)} bytes. Transcribiendo...")
+                    user_text = transcribe_audio(audio_path)
+
+                log(f"Mic PC => {user_text}")
                 answer = ask_and_speak(
                     user_text,
                     payload.get("volume") or "alto",
@@ -775,7 +1097,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     port = int(os.getenv("OTTOHABLA_PORT", "8000"))
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server = HTTPServer(("127.0.0.1", port), Handler)
     log(f"Mini app lista en http://127.0.0.1:{port}")
     try:
         server.serve_forever()

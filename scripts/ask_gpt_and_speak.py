@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -134,28 +135,42 @@ def play_on_g1(wav_path: Path, volume: str, gain_db: str) -> None:
     )
 
 
+def clean_text_for_speech(text: str) -> str:
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"__([^_]+)__", r"\1", text)
+    text = re.sub(r"[*_#>`~]+", "", text)
+    text = re.sub(r"^\s*[-+]\s+", "", text, flags=re.MULTILINE)
+    return " ".join(text.split())
+
+
 def speak_with_remote_piper(text: str, host: str, identity_file: Path, otto_say: str, volume: str) -> None:
+    clean_text = clean_text_for_speech(text)
     remote_command = " ".join(
         [
             shlex.quote(otto_say),
-            shlex.quote(text),
+            shlex.quote(clean_text),
             shlex.quote(volume),
         ]
     )
-    subprocess.run(
-        [
-            "ssh",
-            "-i",
-            str(identity_file),
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=no",
-            host,
-            remote_command,
-        ],
-        check=True,
-    )
+    cmd = [
+        "ssh",
+        "-i",
+        str(identity_file),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "StrictHostKeyChecking=no",
+        host,
+        remote_command,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=75)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"No pude conectar con el robot por SSH ({host}). {detail}")
 
 
 def main() -> int:
