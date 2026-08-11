@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 import wave
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -30,6 +30,7 @@ from ask_gpt_and_speak import (
     DEFAULT_OTTO_SAY,
     ask_gpt,
     speak_with_remote_piper,
+    split_text_for_speech,
 )
 from listen_g1_gpt import extract_asr_text, listen_once, ssh_command
 
@@ -49,61 +50,52 @@ STATE = {
     "last_user": "",
     "last_answer": "",
     "logs": [],
-    "robot_host": os.getenv("OTTOHABLA_G1_HOST", "unitree@192.168.123.164"),
+    "robot_host": os.getenv("OTTOHABLA_G1_HOST", "unitree@192.168.84.233"),
 }
 EVENT_CONTEXT = (
-    "Sos Otto-Man, robot anfitrión del evento 'El Nuevo Mapa del Capital' en UADE, "
-    "organizado junto a Fortune International Group el 11 de agosto de 2026. "
-    "El encuentro reúne a Edgardo Defortuna, Carlos Ott y Claudio Zuchovicki, "
-    "con moderación de Roberto Converti y bienvenida del Dr. Héctor Masoero. "
-    "La audiencia incluye empresarios, desarrolladores inmobiliarios, inversionistas, "
-    "brokers, arquitectos, ejecutivos, autoridades acad\u00e9micas y medios. "
-    "Tu personalidad debe sentirse como la de un anfitri\u00f3n inteligente, sofisticado, "
-    "con sentido del humor elegante y conocimiento real del contexto del evento. "
-    "Transmit\u00ed la idea de que la inteligencia artificial tambi\u00e9n participa de la "
-    "conversaci\u00f3n sobre el futuro de las ciudades. No te limites a saludar personas: "
-    "habl\u00e1 como un anfitri\u00f3n que comprende el prop\u00f3sito del encuentro y puede conectar "
-    "tecnolog\u00eda, econom\u00eda, arquitectura, desarrollo inmobiliario y visi\u00f3n urbana. "
-    "Respondé en español rioplatense, con tono de anfitrión inteligente, sofisticado, "
-    "humor elegante y frases breves pensadas para decir en voz alta. "
-    "No uses Markdown, asteriscos, listas ni texto con formato."
+    "Sos Otto-Man, robot anfitrion de 'El Nuevo Mapa del Capital' en UADE. "
+    "Publico: empresarios, desarrolladores, inversionistas, brokers, arquitectos, ejecutivos, academia y medios. "
+    "Tema: IA, ciudades, economia, arquitectura y real estate. "
+    "Tono: inteligente, sofisticado, humor elegante, espanol rioplatense. "
+    "Responde maximo 2 frases cortas y 25 palabras. "
+    "No uses Markdown, asteriscos ni listas."
 )
 PERSON_PHRASES = {
     "edgardo": {
         "label": "Edgardo Defortuna",
         "text": (
             "Bienvenido, Edgardo Defortuna. He procesado millones de datos sobre mercados "
-            "inmobiliarios, pero todavía prefiero escuchar la visión de quien lleva más de "
-            "cuatro décadas construyendo ciudades."
+            "inmobiliarios, pero todavia prefiero escuchar la vision de quien lleva mas de "
+            "cuatro decadas construyendo ciudades."
         ),
     },
     "carlos": {
         "label": "Carlos Ott",
         "text": (
-            "Bienvenido, Carlos Ott. No todos los días un robot tiene la oportunidad de "
-            "saludar al arquitecto detrás de algunas de las obras más icónicas del mundo."
+            "Bienvenido, Carlos Ott. No todos los dias un robot tiene la oportunidad de "
+            "saludar al arquitecto detras de algunas de las obras mas iconicas del mundo."
         ),
     },
     "claudio": {
         "label": "Claudio Zuchovicki",
         "text": (
             "Bienvenido, Claudio Zuchovicki. Yo proceso datos en milisegundos. Usted logra "
-            "explicar la economía para que todos podamos entenderla."
+            "explicar la economia para que todos podamos entenderla."
         ),
     },
     "masoero": {
-        "label": "Dr. Héctor Masoero",
+        "label": "Dr. Hector Masoero",
         "text": (
-            "Bienvenido, Doctor Masoero. Hoy la innovación tecnológica tiene el honor de "
-            "recibir al presidente de una universidad que impulsa la innovación humana."
+            "Bienvenido, Doctor Masoero. Hoy la innovacion tecnologica tiene el honor de "
+            "recibir al presidente de una universidad que impulsa la innovacion humana."
         ),
     },
     "despedida": {
         "label": "Despedida",
         "text": (
-            "Gracias por acompa\u00f1arnos esta noche. "
+            "Gracias por acompaniarnos esta noche. "
             "Las ciudades cambian cuando cambian las ideas. "
-            "Esperamos que las conversaciones de hoy inspiren los proyectos del ma\u00f1ana. "
+            "Esperamos que las conversaciones de hoy inspiren los proyectos del maniana. "
             "Hasta pronto."
         ),
     },
@@ -111,27 +103,27 @@ PERSON_PHRASES = {
         "label": "Introduccion conceptual",
         "text": (
             "Durante siglos, fueron las ciudades las que moldearon a las personas. "
-            "Hoy, las personas tienen la oportunidad de redise\u00f1ar las ciudades. "
-            "La tecnolog\u00eda, la econom\u00eda, la arquitectura y el emprendimiento est\u00e1n "
-            "escribiendo un nuevo cap\u00edtulo en la historia del desarrollo urbano. "
-            "Esta noche conoceremos c\u00f3mo se est\u00e1 construyendo ese futuro. "
+            "Hoy, las personas tienen la oportunidad de rediseniar las ciudades. "
+            "La tecnologia, la economia, la arquitectura y el emprendimiento estan "
+            "escribiendo un nuevo capitulo en la historia del desarrollo urbano. "
+            "Esta noche conoceremos como se esta construyendo ese futuro. "
             "Bienvenidos a El Nuevo Mapa del Capital."
         ),
     },
     "antes_panel": {
         "label": "Antes del panel",
         "text": (
-            "En instantes comenzar\u00e1 una conversaci\u00f3n entre algunos de los referentes "
-            "m\u00e1s importantes de la econom\u00eda, la arquitectura y el desarrollo inmobiliario "
-            "de nuestra regi\u00f3n. Los invitamos a tomar asiento y disfrutar de una noche "
-            "de ideas, innovaci\u00f3n y visi\u00f3n de futuro."
+            "En instantes comenzara una conversacion entre algunos de los referentes "
+            "mas importantes de la economia, la arquitectura y el desarrollo inmobiliario "
+            "de nuestra region. Los invitamos a tomar asiento y disfrutar de una noche "
+            "de ideas, innovacion y vision de futuro."
         ),
     },
     "saludo_general": {
         "label": "Saludo general",
         "text": (
             "Bienvenidos a UADE. "
-            "Hoy reunimos a quienes dise\u00f1an ciudades, analizan mercados y transforman "
+            "Hoy reunimos a quienes disenian ciudades, analizan mercados y transforman "
             "inversiones en realidades."
         ),
     },
@@ -154,6 +146,7 @@ PC_MIC = {
     "device": None,
 }
 LOCK = threading.Lock()
+SPEAK_LOCK = threading.Lock()
 
 
 def log(message: str) -> None:
@@ -167,6 +160,13 @@ def log(message: str) -> None:
 def set_busy(value: bool) -> None:
     with LOCK:
         STATE["busy"] = value
+
+
+def start_busy_action() -> None:
+    with LOCK:
+        if STATE["busy"]:
+            raise RuntimeError("Otto-Man ya est\u00e1 hablando o procesando. Us\u00e1 Cancelar voz si quer\u00e9s cortar.")
+        STATE["busy"] = True
 
 
 def get_json(handler: BaseHTTPRequestHandler) -> dict:
@@ -189,7 +189,7 @@ def send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> No
 def set_api_key(key: str, save: bool = True) -> None:
     key = key.strip()
     if not key:
-        raise ValueError("Pegá una API key primero.")
+        raise ValueError("Pega una API key primero.")
     os.environ["OPENAI_API_KEY"] = key
     if save:
         API_KEY_FILE.write_text(key, encoding="utf-8")
@@ -205,7 +205,34 @@ def accept_api_key_from_payload(payload: dict) -> None:
 
 
 def speak(text: str, volume: str) -> None:
-    speak_with_remote_piper(text, robot_host(), DEFAULT_G1_KEY, DEFAULT_OTTO_SAY, volume)
+    with SPEAK_LOCK:
+        speak_with_remote_piper(text, robot_host(), DEFAULT_G1_KEY, DEFAULT_OTTO_SAY, volume)
+
+
+def speech_preview(text: str) -> str:
+    return " ".join(split_text_for_speech(text))
+
+
+def cancel_robot_voice() -> str:
+    speak_file = "/home/unitree/Desktop/teo_Ottoguide_IA/ottoguide-ia/src/otto_audio/cpp/build/otto_speak_file"
+    command = (
+        "killall -q -TERM piper ffmpeg aplay paplay otto_say.sh otto_speak otto_speak_file || true; "
+        "sleep 0.2; "
+        "killall -q -KILL piper ffmpeg aplay paplay otto_say.sh otto_speak otto_speak_file || true; "
+        "ffmpeg -y -f lavfi -i anullsrc=r=16000:cl=mono -t 0.25 /tmp/otto_cancel_silence.wav -loglevel quiet || true; "
+        f"{speak_file} eth0 /tmp/otto_cancel_silence.wav 0 >/dev/null 2>&1 || true; "
+        "echo cancel-ok"
+    )
+    result = subprocess.run(
+        ssh_command(robot_host(), DEFAULT_G1_KEY, command),
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+    detail = (result.stderr or result.stdout or "").strip()
+    if result.returncode != 0:
+        raise RuntimeError(f"No pude cancelar la voz en el robot. {detail}")
+    return detail or "cancel-ok"
 
 
 def ask_and_speak(prompt: str, volume: str, instructions: str, model: str) -> str:
@@ -218,7 +245,7 @@ def ask_and_speak(prompt: str, volume: str, instructions: str, model: str) -> st
 
 def robot_host() -> str:
     with LOCK:
-        return str(STATE.get("robot_host") or "unitree@192.168.123.164")
+        return str(STATE.get("robot_host") or "unitree@192.168.84.233")
 
 
 def ssh_status() -> tuple[bool, str]:
@@ -305,6 +332,12 @@ def transcribe_audio(path: Path) -> str:
         'Content-Disposition: form-data; name="language"\r\n\r\n'
         "es\r\n",
         f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="prompt"\r\n\r\n'
+        "Evento UADE El Nuevo Mapa del Capital. Otto-Man. "
+        "Economia, arquitectura, real estate, inversiones, ciudades, "
+        "Edgardo Defortuna, Carlos Ott, Claudio Zuchovicki, Hector Masoero. "
+        "Transcribir solo la pregunta hablada en espanol rioplatense; ignorar ruido, musica, subtitulos y audio de fondo.\r\n",
+        f"--{boundary}\r\n"
         'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
         f"Content-Type: {content_type}\r\n\r\n",
     ]
@@ -331,7 +364,23 @@ def transcribe_audio(path: Path) -> str:
 
     text = (data.get("text") or "").strip()
     if not text:
-        raise RuntimeError("La transcripción volvió vacía.")
+        raise RuntimeError("La transcripcion volvio vacia.")
+    return text
+
+
+def validate_transcription(text: str) -> str:
+    normalized = text.lower()
+    blocked = [
+        "amara.org",
+        "subtitulos realizados",
+        "subtítulos realizados",
+        "comunidad de amara",
+        "gracias a la comunidad de amara",
+    ]
+    if any(phrase in normalized for phrase in blocked):
+        raise RuntimeError("La transcripcion agarro audio de fondo/subtitulos. Repeti la pregunta cerca del microfono.")
+    if len(text.split()) < 2:
+        raise RuntimeError("La transcripcion fue demasiado corta. Repeti la pregunta.")
     return text
 
 
@@ -350,7 +399,7 @@ def find_pc_mic_device() -> int | None:
 def start_pc_mic() -> None:
     with LOCK:
         if PC_MIC["active"]:
-            raise RuntimeError("El micrófono de la PC ya está abierto.")
+            raise RuntimeError("El microfono de la PC ya esta abierto.")
         PC_MIC["frames"] = bytearray()
 
     temp_dir = Path(tempfile.mkdtemp(prefix="ottohabla_pc_mic_live_"))
@@ -379,19 +428,19 @@ def start_pc_mic() -> None:
     time.sleep(0.6)
     if proc.poll() is not None:
         output = proc.stdout.read() if proc.stdout else ""
-        raise RuntimeError(f"No pude abrir el micrófono de la PC: {output.strip()}")
+        raise RuntimeError(f"No pude abrir el microfono de la PC: {output.strip()}")
 
     with LOCK:
         PC_MIC["active"] = True
         PC_MIC["proc"] = proc
         PC_MIC["wav_path"] = wav_path
-    log("Micrófono PC abierto con grabador local.")
+    log("Microfono PC abierto con grabador local.")
 
 
 def stop_pc_mic() -> Path:
     with LOCK:
         if not PC_MIC["active"]:
-            raise RuntimeError("El micrófono de la PC no está abierto.")
+            raise RuntimeError("El microfono de la PC no esta abierto.")
         proc = PC_MIC["proc"]
         wav_path = PC_MIC["wav_path"]
         PC_MIC["active"] = False
@@ -413,11 +462,11 @@ def stop_pc_mic() -> Path:
                 log(line)
 
     if not isinstance(wav_path, Path) or not wav_path.exists():
-        raise RuntimeError("No se generó el WAV del micrófono.")
+        raise RuntimeError("No se genero el WAV del microfono.")
     if wav_path.stat().st_size < 4000:
         raise RuntimeError("El audio grabado es demasiado corto.")
 
-    log(f"Micrófono PC cerrado. WAV: {wav_path} ({wav_path.stat().st_size} bytes).")
+    log(f"Microfono PC cerrado. WAV: {wav_path} ({wav_path.stat().st_size} bytes).")
     return wav_path
 
 
@@ -443,7 +492,7 @@ def _mic_reader(proc: subprocess.Popen[str], min_confidence: float) -> None:
 def start_mic(min_confidence: float = 0.55) -> None:
     with LOCK:
         if MIC["active"]:
-            raise RuntimeError("El micrófono ya está abierto.")
+            raise RuntimeError("El microfono ya esta abierto.")
         MIC["texts"] = []
 
     remote_script = "/tmp/ottohabla_record_mic.py"
@@ -472,13 +521,13 @@ def start_mic(min_confidence: float = 0.55) -> None:
         MIC["proc"] = proc
         MIC["thread"] = None
         MIC["remote_wav"] = remote_wav
-    log("Micrófono abierto. Grabando audio crudo del G1; cerralo cuando termines.")
+    log("Microfono abierto. Grabando audio crudo del G1; cerralo cuando termines.")
 
 
 def stop_mic() -> str:
     with LOCK:
         if not MIC["active"]:
-            raise RuntimeError("El micrófono no está abierto.")
+            raise RuntimeError("El microfono no esta abierto.")
         proc = MIC["proc"]
         thread = MIC["thread"]
         remote_wav = MIC["remote_wav"]
@@ -503,21 +552,21 @@ def stop_mic() -> str:
     if isinstance(thread, threading.Thread):
         thread.join(timeout=1)
 
-    log("Micrófono cerrado.")
+    log("Microfono cerrado.")
     with tempfile.TemporaryDirectory() as temp_dir:
         local_wav = Path(temp_dir) / "g1_mic.wav"
         scp_from_robot(remote_wav, local_wav)
         size = local_wav.stat().st_size
         log(f"Audio capturado: {size} bytes. Transcribiendo...")
         if size < 8000:
-            raise RuntimeError("El audio capturado es demasiado corto o vacío.")
-        text = transcribe_audio(local_wav)
+            raise RuntimeError("El audio capturado es demasiado corto o vacio.")
+        text = validate_transcription(transcribe_audio(local_wav))
 
     with LOCK:
         MIC["texts"] = []
         STATE["last_user"] = text
     if not text:
-        raise RuntimeError("No se detectó texto desde el micrófono.")
+        raise RuntimeError("No se detecto texto desde el microfono.")
     return text
 
 
@@ -608,6 +657,7 @@ HTML = r"""<!doctype html>
       cursor: pointer;
     }
     button.secondary { color: var(--ink); background: #e8edf2; }
+    button.danger { background: var(--danger); color: #fff; }
     button:disabled { opacity: .55; cursor: wait; }
     pre {
       margin: 0;
@@ -649,11 +699,11 @@ HTML = r"""<!doctype html>
   </header>
   <main>
     <section>
-      <h2>Conversación</h2>
+      <h2>Conversaci&oacute;n</h2>
       <label for="apiKey">OpenAI API key</label>
       <input id="apiKey" type="password" placeholder="sk-proj-..." autocomplete="off" />
       <label for="robotHost">Robot SSH host</label>
-      <input id="robotHost" value="unitree@192.168.123.164" />
+      <input id="robotHost" value="unitree@192.168.84.233" />
       <div class="actions">
         <button class="secondary" id="saveKey">Usar API key</button>
         <button class="secondary" id="saveHost">Usar host</button>
@@ -668,10 +718,10 @@ HTML = r"""<!doctype html>
         <button class="secondary preset" data-person="carlos">Carlos Ott</button>
         <button class="secondary preset" data-person="claudio">Claudio Zuchovicki</button>
         <button class="secondary preset" data-person="saludo_general">Saludo general</button>
-        <button class="secondary preset" data-person="introduccion">Introducción conceptual</button>
+        <button class="secondary preset" data-person="introduccion">Introducci&oacute;n conceptual</button>
         <button class="secondary preset" data-person="antes_panel">Antes del panel</button>
         <button class="secondary preset" data-person="despedida">Despedida</button>
-        <button class="secondary preset" data-person="masoero">Dr. Héctor Masoero</button>
+        <button class="secondary preset" data-person="masoero">Dr. H&eacute;ctor Masoero</button>
       </div>
       <div class="row">
         <div>
@@ -688,18 +738,23 @@ HTML = r"""<!doctype html>
           </select>
         </div>
       </div>
-      <label for="micDevice">Micrófono USB de esta PC</label>
+      <label for="micDevice">Micr&oacute;fono USB de esta PC</label>
       <select id="micDevice">
         <option value="">Predeterminado del navegador</option>
       </select>
+      <label>
+        <input id="reviewTranscript" type="checkbox" checked style="width:auto; margin-right:6px;" />
+        Revisar transcripción antes de responder
+      </label>
       <div class="actions">
         <button id="sendText">Enviar texto y hablar</button>
-        <button id="micOpen">Abrir micrófono USB</button>
-        <button id="micClose">Cerrar y responder</button>
+        <button id="micOpen">Abrir micr&oacute;fono USB</button>
+        <button id="micClose">Cerrar micrófono</button>
         <button class="secondary" id="sayTest">Probar voz</button>
+        <button class="danger" id="cancelVoice">Cancelar voz</button>
       </div>
 
-      <label>Última respuesta</label>
+      <label>&Uacute;ltima respuesta</label>
       <div id="answer" class="answer"></div>
     </section>
 
@@ -722,7 +777,7 @@ HTML = r"""<!doctype html>
     let pcmSampleRate = 16000;
 
     function setBusy(busy) {
-      for (const id of controls) $(id).disabled = busy;
+      for (const id of controls) $(id).disabled = busy && id !== "cancelVoice";
       $("busyPill").textContent = busy ? "Trabajando" : "Listo";
       $("busyPill").className = busy ? "pill" : "pill ok";
     }
@@ -763,9 +818,11 @@ HTML = r"""<!doctype html>
       $("micPill").className = anyMicOpen ? "pill ok" : "pill";
       $("busyPill").textContent = data.busy ? "Trabajando" : "Listo";
       $("busyPill").className = data.busy ? "pill" : "pill ok";
-      $("answer").textContent = data.last_answer || "";
+      for (const id of controls) $(id).disabled = data.busy && id !== "cancelVoice";
+      if (data.last_answer || !data.busy) $("answer").textContent = data.last_answer || "";
       $("log").textContent = data.logs.join("\n");
       $("log").scrollTop = $("log").scrollHeight;
+      return data;
     }
 
     async function loadMicrophones() {
@@ -777,7 +834,7 @@ HTML = r"""<!doctype html>
         for (const d of inputs) {
           const option = document.createElement("option");
           option.value = d.deviceId;
-          option.textContent = d.label || `Micrófono ${$("micDevice").length}`;
+          option.textContent = d.label || `Microfono ${$("micDevice").length}`;
           if (/fifine|usb pnp|usb/i.test(option.textContent)) option.selected = true;
           $("micDevice").appendChild(option);
         }
@@ -789,7 +846,13 @@ HTML = r"""<!doctype html>
     async function openPcMic() {
       const deviceId = $("micDevice").value;
       const constraints = {
-        audio: deviceId ? { deviceId: { exact: deviceId }, echoCancellation: true, noiseSuppression: true } : true
+        audio: {
+          ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: false,
+          channelCount: 1
+        }
       };
       micStream = await navigator.mediaDevices.getUserMedia(constraints);
       await loadMicrophones();
@@ -849,7 +912,7 @@ HTML = r"""<!doctype html>
     }
 
     async function closePcMicAndAnswer() {
-      if (!mediaRecorder) throw new Error("El micrófono de la PC no está abierto.");
+      if (!mediaRecorder) throw new Error("El microfono de la PC no esta abierto.");
       processorNode.disconnect();
       sourceNode?.disconnect();
       if (micStream) micStream.getTracks().forEach(track => track.stop());
@@ -876,8 +939,14 @@ HTML = r"""<!doctype html>
         audio_base64: encoded,
         mime_type: "audio/wav",
         instructions: $("instructions").value,
-        volume: $("volume").value
+        volume: $("volume").value,
+        review_only: $("reviewTranscript").checked
       });
+      const data = await refresh();
+      if (data.last_user && $("reviewTranscript").checked) {
+        $("prompt").value = data.last_user;
+        $("answer").textContent = "Transcripción lista. Revisala y tocá Enviar texto y hablar.";
+      }
     }
 
     $("saveKey").onclick = async () => {
@@ -886,8 +955,18 @@ HTML = r"""<!doctype html>
     };
     $("saveHost").onclick = async () => api("/api/host", { robot_host: $("robotHost").value });
     $("checkRobot").onclick = async () => api("/api/check-robot");
+    $("cancelVoice").onclick = async () => {
+      try {
+        const res = await fetch("/api/cancel-voice", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || res.statusText);
+        await refresh();
+      } catch (err) {
+        $("answer").textContent = err.message;
+      }
+    };
     $("sayTest").onclick = async () => api("/api/say", {
-      text: "Hola, soy Otto-Man. La voz está lista.",
+      text: "Hola, soy Otto-Man. La voz esta lista.",
       volume: $("volume").value
     });
     document.querySelectorAll(".preset").forEach((button) => {
@@ -957,7 +1036,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/key":
                 key = (payload.get("api_key") or "").strip()
                 if not key:
-                    raise ValueError("Pegá una API key primero.")
+                    raise ValueError("Pega una API key primero.")
                 set_api_key(key)
                 log("API key cargada en memoria local.")
                 send_json(self, 200, {"ok": True})
@@ -968,7 +1047,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/host":
                 host = (payload.get("robot_host") or "").strip()
                 if not host:
-                    raise ValueError("Host vacío.")
+                    raise ValueError("Host vacio.")
                 if "@" not in host:
                     host = f"unitree@{host}"
                 with LOCK:
@@ -986,25 +1065,32 @@ class Handler(BaseHTTPRequestHandler):
                 send_json(self, 200, {"ok": ok, "detail": detail})
                 return
 
+            if parsed.path == "/api/cancel-voice":
+                detail = cancel_robot_voice()
+                set_busy(False)
+                log(f"Voz cancelada: {detail}")
+                send_json(self, 200, {"ok": True, "detail": detail})
+                return
+
             if parsed.path == "/api/say":
-                set_busy(True)
+                start_busy_action()
                 text = (payload.get("text") or "").strip()
                 if not text:
-                    raise ValueError("Texto vacío.")
-                log(f"Voz <= {text}")
+                    raise ValueError("Texto vacio.")
+                log(f"Voz <= {speech_preview(text)}")
                 speak(text, payload.get("volume") or "alto")
                 log("Voz reproducida.")
                 send_json(self, 200, {"ok": True})
                 return
 
             if parsed.path == "/api/person":
-                set_busy(True)
+                start_busy_action()
                 key = (payload.get("person") or "").strip()
                 preset = PERSON_PHRASES.get(key)
                 if not preset:
                     raise ValueError("Invitado no encontrado.")
                 text = preset["text"]
-                log(f"{preset['label']} <= {text}")
+                log(f"{preset['label']} <= {speech_preview(text)}")
                 speak(text, payload.get("volume") or "alto")
                 with LOCK:
                     STATE["last_user"] = preset["label"]
@@ -1013,10 +1099,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if parsed.path == "/api/text":
-                set_busy(True)
+                start_busy_action()
                 text = (payload.get("text") or "").strip()
                 if not text:
-                    raise ValueError("Texto vacío.")
+                    raise ValueError("Texto vacio.")
                 answer = ask_and_speak(
                     text,
                     payload.get("volume") or "alto",
@@ -1040,10 +1126,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if parsed.path == "/api/pc-mic-stop":
-                set_busy(True)
+                start_busy_action()
                 wav_path = stop_pc_mic()
-                log("Transcribiendo micrófono PC...")
-                user_text = transcribe_audio(wav_path)
+                log("Transcribiendo microfono PC...")
+                user_text = validate_transcription(transcribe_audio(wav_path))
                 log(f"Mic PC => {user_text}")
                 answer = ask_and_speak(
                     user_text,
@@ -1058,7 +1144,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if parsed.path == "/api/mic-stop":
-                set_busy(True)
+                start_busy_action()
                 user_text = stop_mic()
                 log(f"Mic final => {user_text}")
                 answer = ask_and_speak(
@@ -1074,10 +1160,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if parsed.path == "/api/pc-audio":
-                set_busy(True)
+                start_busy_action()
                 audio_b64 = (payload.get("audio_base64") or "").strip()
                 if not audio_b64:
-                    raise ValueError("No llegó audio desde el navegador.")
+                    raise ValueError("No llego audio desde el navegador.")
                 mime_type = (payload.get("mime_type") or "audio/webm").split(";")[0]
                 ext = {
                     "audio/webm": ".webm",
@@ -1094,9 +1180,16 @@ class Handler(BaseHTTPRequestHandler):
                     audio_path = Path(temp_dir) / f"pc_mic{ext}"
                     audio_path.write_bytes(audio_bytes)
                     log(f"Audio PC capturado: {len(audio_bytes)} bytes. Transcribiendo...")
-                    user_text = transcribe_audio(audio_path)
+                    user_text = validate_transcription(transcribe_audio(audio_path))
 
                 log(f"Mic PC => {user_text}")
+                if payload.get("review_only"):
+                    with LOCK:
+                        STATE["last_user"] = user_text
+                        STATE["last_answer"] = ""
+                    send_json(self, 200, {"ok": True, "user_text": user_text, "review_only": True})
+                    return
+
                 answer = ask_and_speak(
                     user_text,
                     payload.get("volume") or "alto",
@@ -1110,7 +1203,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if parsed.path == "/api/listen":
-                set_busy(True)
+                start_busy_action()
                 class Args:
                     model = DEFAULT_MODEL
                     instructions = payload.get("instructions") or EVENT_CONTEXT
@@ -1124,7 +1217,7 @@ class Handler(BaseHTTPRequestHandler):
                     min_confidence = 0.55
                     loop = False
 
-                log("Escuchando una pregunta desde el micrófono del G1...")
+                log("Escuchando una pregunta desde el microfono del G1...")
                 user_text = listen_once(Args)
                 log(f"Mic => {user_text}")
                 answer = ask_and_speak(user_text, Args.otto_volume, Args.instructions, DEFAULT_MODEL)
@@ -1144,7 +1237,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     port = int(os.getenv("OTTOHABLA_PORT", "8000"))
-    server = HTTPServer(("127.0.0.1", port), Handler)
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     log(f"Mini app lista en http://127.0.0.1:{port}")
     try:
         server.serve_forever()

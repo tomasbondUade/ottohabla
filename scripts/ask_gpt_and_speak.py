@@ -20,7 +20,8 @@ DEFAULT_G1_KEY = Path.home() / ".ssh" / "ottohabla_g1"
 DEFAULT_OTTO_SAY = "/home/unitree/Desktop/teo_Ottoguide_IA/ottoguide-ia/src/otto_audio/scripts/otto_say.sh"
 DEFAULT_INSTRUCTIONS = (
     "Sos Otto-Man, un robot Unitree G1. Respondé en español rioplatense, "
-    "con frases cortas, claras y naturales para decir en voz alta."
+    "con frases cortas, claras y naturales para decir en voz alta. "
+    "Maximo 2 frases cortas y 25 palabras."
 )
 
 
@@ -59,8 +60,9 @@ def ask_gpt(prompt: str, model: str, instructions: str) -> str:
 
     payload = {
         "model": model,
-        "instructions": instructions,
+        "instructions": f"{instructions} Responde siempre en maximo 2 frases cortas y 25 palabras.",
         "input": prompt,
+        "max_output_tokens": 80,
     }
     request = urllib.request.Request(
         "https://api.openai.com/v1/responses",
@@ -81,7 +83,7 @@ def ask_gpt(prompt: str, model: str, instructions: str) -> str:
 
     text = data.get("output_text")
     if isinstance(text, str) and text.strip():
-        return text.strip()
+        return limit_answer_length(text.strip())
 
     parts: list[str] = []
     for item in data.get("output", []):
@@ -89,9 +91,21 @@ def ask_gpt(prompt: str, model: str, instructions: str) -> str:
             if content.get("type") == "output_text" and content.get("text"):
                 parts.append(content["text"])
     if parts:
-        return "\n".join(parts).strip()
+        return limit_answer_length("\n".join(parts).strip())
 
     raise RuntimeError("The OpenAI response did not include text output.")
+
+
+def limit_answer_length(text: str, max_words: int = 32, max_chars: int = 260) -> str:
+    text = " ".join(text.split())
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    limited = " ".join(sentence for sentence in sentences[:2] if sentence).strip() or text
+    words = limited.split()
+    if len(words) > max_words:
+        limited = " ".join(words[:max_words]).rstrip(" ,;:.!?") + "."
+    if len(limited) > max_chars:
+        limited = limited[:max_chars].rsplit(" ", 1)[0].rstrip(" ,;:.!?") + "."
+    return limited
 
 
 def text_to_wav(text: str, wav_path: Path, voice: str) -> None:
@@ -145,32 +159,60 @@ def clean_text_for_speech(text: str) -> str:
     return " ".join(text.split())
 
 
+def soften_punctuation_for_speech(text: str) -> str:
+    text = text.replace("…", ", ")
+    text = re.sub(r"\.{2,}", ", ", text)
+    text = re.sub(r"\s*[.;:]\s*", ", ", text)
+    text = re.sub(r"\s*,\s*", ", ", text)
+    text = re.sub(r"\s*[!?]\s*", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"[.;:,!?…]+$", "", text).strip()
+    return text
+
+
+def split_text_for_speech(text: str, max_chars: int = 1000) -> list[str]:
+    sentences = re.split(r"(?<=[.!?…])\s+", clean_text_for_speech(text))
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        if not sentence:
+            continue
+        if current and len(current) + 1 + len(sentence) > max_chars:
+            chunks.append(current)
+            current = sentence
+        else:
+            current = f"{current} {sentence}".strip()
+    if current:
+        chunks.append(current)
+    return [soften_punctuation_for_speech(chunk) for chunk in chunks] or [soften_punctuation_for_speech(clean_text_for_speech(text))]
+
+
 def speak_with_remote_piper(text: str, host: str, identity_file: Path, otto_say: str, volume: str) -> None:
-    clean_text = clean_text_for_speech(text)
-    remote_command = " ".join(
-        [
-            shlex.quote(otto_say),
-            shlex.quote(clean_text),
-            shlex.quote(volume),
+    for chunk in split_text_for_speech(text):
+        remote_command = " ".join(
+            [
+                shlex.quote(otto_say),
+                shlex.quote(chunk),
+                shlex.quote(volume),
+            ]
+        )
+        cmd = [
+            "ssh",
+            "-i",
+            str(identity_file),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "StrictHostKeyChecking=no",
+            host,
+            remote_command,
         ]
-    )
-    cmd = [
-        "ssh",
-        "-i",
-        str(identity_file),
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=5",
-        "-o",
-        "StrictHostKeyChecking=no",
-        host,
-        remote_command,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=75)
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"No pude conectar con el robot por SSH ({host}). {detail}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=75)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"No pude conectar con el robot por SSH ({host}). {detail}")
 
 
 def main() -> int:
