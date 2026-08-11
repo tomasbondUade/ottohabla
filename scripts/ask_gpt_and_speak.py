@@ -19,7 +19,7 @@ DEFAULT_G1_HOST = "unitree@192.168.123.164"
 DEFAULT_G1_KEY = Path.home() / ".ssh" / "ottohabla_g1"
 DEFAULT_OTTO_SAY = "/home/unitree/Desktop/teo_Ottoguide_IA/ottoguide-ia/src/otto_audio/scripts/otto_say.sh"
 DEFAULT_INSTRUCTIONS = (
-    "Sos Otto Habla, un robot Unitree G1. Respondé en español rioplatense, "
+    "Sos Otto-Man, un robot Unitree G1. Respondé en español rioplatense, "
     "con frases cortas, claras y naturales para decir en voz alta."
 )
 

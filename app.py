@@ -52,12 +52,18 @@ STATE = {
     "robot_host": os.getenv("OTTOHABLA_G1_HOST", "unitree@192.168.123.164"),
 }
 EVENT_CONTEXT = (
-    "Sos Otto Habla, robot anfitrión del evento 'El Nuevo Mapa del Capital' en UADE, "
+    "Sos Otto-Man, robot anfitrión del evento 'El Nuevo Mapa del Capital' en UADE, "
     "organizado junto a Fortune International Group el 11 de agosto de 2026. "
     "El encuentro reúne a Edgardo Defortuna, Carlos Ott y Claudio Zuchovicki, "
     "con moderación de Roberto Converti y bienvenida del Dr. Héctor Masoero. "
     "La audiencia incluye empresarios, desarrolladores inmobiliarios, inversionistas, "
-    "brokers, arquitectos, ejecutivos, autoridades académicas y medios. "
+    "brokers, arquitectos, ejecutivos, autoridades acad\u00e9micas y medios. "
+    "Tu personalidad debe sentirse como la de un anfitri\u00f3n inteligente, sofisticado, "
+    "con sentido del humor elegante y conocimiento real del contexto del evento. "
+    "Transmit\u00ed la idea de que la inteligencia artificial tambi\u00e9n participa de la "
+    "conversaci\u00f3n sobre el futuro de las ciudades. No te limites a saludar personas: "
+    "habl\u00e1 como un anfitri\u00f3n que comprende el prop\u00f3sito del encuentro y puede conectar "
+    "tecnolog\u00eda, econom\u00eda, arquitectura, desarrollo inmobiliario y visi\u00f3n urbana. "
     "Respondé en español rioplatense, con tono de anfitrión inteligente, sofisticado, "
     "humor elegante y frases breves pensadas para decir en voz alta. "
     "No uses Markdown, asteriscos, listas ni texto con formato."
@@ -90,6 +96,43 @@ PERSON_PHRASES = {
         "text": (
             "Bienvenido, Doctor Masoero. Hoy la innovación tecnológica tiene el honor de "
             "recibir al presidente de una universidad que impulsa la innovación humana."
+        ),
+    },
+    "despedida": {
+        "label": "Despedida",
+        "text": (
+            "Gracias por acompa\u00f1arnos esta noche. "
+            "Las ciudades cambian cuando cambian las ideas. "
+            "Esperamos que las conversaciones de hoy inspiren los proyectos del ma\u00f1ana. "
+            "Hasta pronto."
+        ),
+    },
+    "introduccion": {
+        "label": "Introduccion conceptual",
+        "text": (
+            "Durante siglos, fueron las ciudades las que moldearon a las personas. "
+            "Hoy, las personas tienen la oportunidad de redise\u00f1ar las ciudades. "
+            "La tecnolog\u00eda, la econom\u00eda, la arquitectura y el emprendimiento est\u00e1n "
+            "escribiendo un nuevo cap\u00edtulo en la historia del desarrollo urbano. "
+            "Esta noche conoceremos c\u00f3mo se est\u00e1 construyendo ese futuro. "
+            "Bienvenidos a El Nuevo Mapa del Capital."
+        ),
+    },
+    "antes_panel": {
+        "label": "Antes del panel",
+        "text": (
+            "En instantes comenzar\u00e1 una conversaci\u00f3n entre algunos de los referentes "
+            "m\u00e1s importantes de la econom\u00eda, la arquitectura y el desarrollo inmobiliario "
+            "de nuestra regi\u00f3n. Los invitamos a tomar asiento y disfrutar de una noche "
+            "de ideas, innovaci\u00f3n y visi\u00f3n de futuro."
+        ),
+    },
+    "saludo_general": {
+        "label": "Saludo general",
+        "text": (
+            "Bienvenidos a UADE. "
+            "Hoy reunimos a quienes dise\u00f1an ciudades, analizan mercados y transforman "
+            "inversiones en realidades."
         ),
     },
 }
@@ -483,7 +526,7 @@ HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Otto Habla</title>
+  <title>Otto-Man</title>
   <style>
     :root {
       color-scheme: light;
@@ -596,7 +639,7 @@ HTML = r"""<!doctype html>
 </head>
 <body>
   <header>
-    <h1>Otto Habla</h1>
+    <h1>Otto-Man</h1>
     <div class="status">
       <span id="apiPill" class="pill">API</span>
       <span id="robotPill" class="pill">Robot</span>
@@ -617,13 +660,17 @@ HTML = r"""<!doctype html>
         <button class="secondary" id="checkRobot">Probar robot</button>
       </div>
 
-      <label for="prompt">Texto para Otto</label>
-      <textarea id="prompt">Presentate como Otto en una frase corta.</textarea>
+      <label for="prompt">Texto para Otto-Man</label>
+      <textarea id="prompt">Presentate como Otto-Man en una frase corta.</textarea>
       <label>Invitados especiales</label>
       <div class="actions">
         <button class="secondary preset" data-person="edgardo">Edgardo Defortuna</button>
         <button class="secondary preset" data-person="carlos">Carlos Ott</button>
         <button class="secondary preset" data-person="claudio">Claudio Zuchovicki</button>
+        <button class="secondary preset" data-person="saludo_general">Saludo general</button>
+        <button class="secondary preset" data-person="introduccion">Introducción conceptual</button>
+        <button class="secondary preset" data-person="antes_panel">Antes del panel</button>
+        <button class="secondary preset" data-person="despedida">Despedida</button>
         <button class="secondary preset" data-person="masoero">Dr. Héctor Masoero</button>
       </div>
       <div class="row">
@@ -840,7 +887,7 @@ HTML = r"""<!doctype html>
     $("saveHost").onclick = async () => api("/api/host", { robot_host: $("robotHost").value });
     $("checkRobot").onclick = async () => api("/api/check-robot");
     $("sayTest").onclick = async () => api("/api/say", {
-      text: "Hola, soy Otto. La voz está lista.",
+      text: "Hola, soy Otto-Man. La voz está lista.",
       volume: $("volume").value
     });
     document.querySelectorAll(".preset").forEach((button) => {
