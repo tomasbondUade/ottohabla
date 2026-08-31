@@ -40,6 +40,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def ssh_command(host: str, identity_file: Path, remote_command: str) -> list[str]:
+    from ask_gpt_and_speak import SSH_MUX_OPTS
+
     return [
         "ssh",
         "-i",
@@ -48,6 +50,7 @@ def ssh_command(host: str, identity_file: Path, remote_command: str) -> list[str
         "BatchMode=yes",
         "-o",
         "StrictHostKeyChecking=no",
+        *SSH_MUX_OPTS,
         host,
         remote_command,
     ]

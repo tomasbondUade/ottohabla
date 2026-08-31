@@ -28,7 +28,10 @@ def wait_for_stdin_stop() -> None:
 
 
 def candidate_sample_rates(default_sr: int) -> list[int]:
-    rates = [default_sr, 16000, 44100, 48000]
+    # 16 kHz primero a propósito: Whisper resamplea a 16 kHz igual, así que grabar a
+    # 44.1 kHz sólo triplica el tamaño del WAV que después hay que subir por la WiFi
+    # del AP, sin aportar nada de calidad. El nativo queda como respaldo.
+    rates = [16000, default_sr, 44100, 48000]
     unique = []
     for rate in rates:
         if rate > 0 and rate not in unique:
