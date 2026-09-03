@@ -3,7 +3,11 @@
 import json
 import os
 import html
+import hashlib
+import io
 import mimetypes
+import re
+import shlex
 import tempfile
 import uuid
 import base64
@@ -20,6 +24,10 @@ from urllib.parse import urlparse
 ROOT = Path(__file__).resolve().parent
 SCRIPTS = ROOT / "scripts"
 API_KEY_FILE = ROOT / ".ottohabla_api_key"
+UI_FILE = ROOT / "ui.html"
+REMOTE_PRESET_DIR = "/home/unitree/Desktop/presets_ottohabla"
+REMOTE_PRESET_SCRIPT = f"{REMOTE_PRESET_DIR}/otto_preset.sh"
+PRESET_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,40}$")
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
@@ -28,6 +36,7 @@ from ask_gpt_and_speak import (
     DEFAULT_G1_KEY,
     DEFAULT_MODEL,
     DEFAULT_OTTO_SAY,
+    SSH_MUX_OPTS,
     ask_gpt,
     speak_with_remote_piper,
     split_text_for_speech,
@@ -49,8 +58,11 @@ STATE = {
     "busy": False,
     "last_user": "",
     "last_answer": "",
+    "phase": "",
     "logs": [],
-    "robot_host": os.getenv("OTTOHABLA_G1_HOST", "unitree@192.168.84.233"),
+    "robot_host": os.getenv("OTTOHABLA_G1_HOST", "unitree@10.42.0.164"),
+    "robot_ok": False,
+    "presets": [],
 }
 EVENT_CONTEXT = (
     "Sos Otto-Man, robot anfitrion de 'El Nuevo Mapa del Capital' en UADE. "
@@ -147,6 +159,7 @@ PC_MIC = {
 }
 LOCK = threading.Lock()
 SPEAK_LOCK = threading.Lock()
+BUSY_OWNER = threading.local()
 
 
 def log(message: str) -> None:
@@ -158,8 +171,28 @@ def log(message: str) -> None:
 
 
 def set_busy(value: bool) -> None:
+    if value:
+        with LOCK:
+            STATE["busy"] = True
+        BUSY_OWNER.active = True
+        return
+    if not getattr(BUSY_OWNER, "active", False):
+        return
     with LOCK:
-        STATE["busy"] = value
+        STATE["busy"] = False
+        STATE["phase"] = ""
+    BUSY_OWNER.active = False
+
+
+def force_clear_busy() -> None:
+    with LOCK:
+        STATE["busy"] = False
+        STATE["phase"] = ""
+
+
+def set_phase(value: str) -> None:
+    with LOCK:
+        STATE["phase"] = value
 
 
 def start_busy_action() -> None:
@@ -167,6 +200,7 @@ def start_busy_action() -> None:
         if STATE["busy"]:
             raise RuntimeError("Otto-Man ya est\u00e1 hablando o procesando. Us\u00e1 Cancelar voz si quer\u00e9s cortar.")
         STATE["busy"] = True
+    BUSY_OWNER.active = True
 
 
 def get_json(handler: BaseHTTPRequestHandler) -> dict:
@@ -193,6 +227,7 @@ def set_api_key(key: str, save: bool = True) -> None:
     os.environ["OPENAI_API_KEY"] = key
     if save:
         API_KEY_FILE.write_text(key, encoding="utf-8")
+        API_KEY_FILE.chmod(0o600)
     with LOCK:
         STATE["api_key_set"] = True
 
@@ -206,7 +241,7 @@ def accept_api_key_from_payload(payload: dict) -> None:
 
 def speak(text: str, volume: str) -> None:
     with SPEAK_LOCK:
-        speak_with_remote_piper(text, robot_host(), DEFAULT_G1_KEY, DEFAULT_OTTO_SAY, volume)
+        speak_with_remote_piper(text, robot_host(), robot_key(), DEFAULT_OTTO_SAY, volume)
 
 
 def speech_preview(text: str) -> str:
@@ -224,7 +259,7 @@ def cancel_robot_voice() -> str:
         "echo cancel-ok"
     )
     result = subprocess.run(
-        ssh_command(robot_host(), DEFAULT_G1_KEY, command),
+        ssh_command(robot_host(), robot_key(), command),
         capture_output=True,
         text=True,
         timeout=8,
@@ -237,15 +272,22 @@ def cancel_robot_voice() -> str:
 
 def ask_and_speak(prompt: str, volume: str, instructions: str, model: str) -> str:
     log(f"GPT <= {prompt}")
+    set_phase("Pensando")
     answer = ask_gpt(prompt, model, instructions).strip()
     log(f"GPT => {answer}")
+    set_phase("Hablando")
     speak(answer, volume)
     return answer
 
 
 def robot_host() -> str:
     with LOCK:
-        return str(STATE.get("robot_host") or "unitree@192.168.84.233")
+        return str(STATE.get("robot_host") or "unitree@10.42.0.164")
+
+
+def robot_key() -> Path:
+    configured = os.getenv("OTTOHABLA_G1_KEY", "").strip()
+    return Path(configured).expanduser() if configured else DEFAULT_G1_KEY
 
 
 def ssh_status() -> tuple[bool, str]:
@@ -254,13 +296,14 @@ def ssh_status() -> tuple[bool, str]:
             [
                 "ssh",
                 "-i",
-                str(DEFAULT_G1_KEY),
+                str(robot_key()),
                 "-o",
                 "BatchMode=yes",
                 "-o",
                 "ConnectTimeout=4",
                 "-o",
                 "StrictHostKeyChecking=no",
+                *SSH_MUX_OPTS,
                 robot_host(),
                 "echo robot-ok",
             ],
@@ -278,40 +321,113 @@ def run_checked(cmd: list[str], timeout: float | None = None) -> subprocess.Comp
     return subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
 
 
-def scp_to_robot(local_path: Path, remote_path: str) -> None:
-    host = robot_host()
-    run_checked(
-        [
-            "scp",
-            "-i",
-            str(DEFAULT_G1_KEY),
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=no",
-            str(local_path),
-            f"{host}:{remote_path}",
-        ],
+def run_ssh(command: str, *, input_text: str | None = None, timeout: float = 30) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        ssh_command(robot_host(), robot_key(), command),
+        input=input_text,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(detail or f"El comando remoto terminó con código {result.returncode}.")
+    return result
+
+
+def validate_preset_name(name: str) -> str:
+    if not PRESET_NAME_RE.fullmatch(name):
+        raise ValueError("Nombre inválido. Usá entre 1 y 40 letras, números, guion o guion bajo.")
+    return name
+
+
+def ensure_remote_preset_script() -> None:
+    local_script = SCRIPTS / "otto_preset.sh"
+    source = local_script.read_text(encoding="utf-8")
+    local_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    check = run_ssh(
+        f"sha256sum {shlex.quote(REMOTE_PRESET_SCRIPT)} 2>/dev/null | awk '{{print $1}}' || true",
+        timeout=10,
+    )
+    if check.stdout.strip() == local_hash:
+        return
+    command = (
+        f"mkdir -p {shlex.quote(REMOTE_PRESET_DIR)} && "
+        f"cat > {shlex.quote(REMOTE_PRESET_SCRIPT)} && "
+        f"chmod 700 {shlex.quote(REMOTE_PRESET_SCRIPT)}"
+    )
+    run_ssh(command, input_text=source, timeout=20)
+    log("Script de presets instalado/actualizado en el robot.")
+
+
+def run_remote_preset(*args: str, input_text: str | None = None, timeout: float = 90) -> str:
+    ensure_remote_preset_script()
+    command = " ".join([shlex.quote(REMOTE_PRESET_SCRIPT), *(shlex.quote(value) for value in args)])
+    return run_ssh(command, input_text=input_text, timeout=timeout).stdout.strip()
+
+
+def refresh_presets() -> list[dict]:
+    raw = run_remote_preset("list", timeout=20)
+    items = json.loads(raw or "[]")
+    if not isinstance(items, list):
+        raise RuntimeError("El robot devolvió un listado de presets inválido.")
+    with LOCK:
+        STATE["presets"] = items
+    return items
+
+
+def render_ui() -> bytes:
+    host = os.getenv("OTTOHABLA_HOST", "127.0.0.1")
+    port = int(os.getenv("OTTOHABLA_PORT", "8000"))
+    public_host = os.getenv("OTTOHABLA_URL_HOST", host)
+    lan_url = os.getenv("OTTOHABLA_LAN_URL", f"http://{public_host}:{port}")
+    page = UI_FILE.read_text(encoding="utf-8")
+    replacements = {
+        "__EVENT_CONTEXT__": html.escape(EVENT_CONTEXT, quote=True),
+        "__ROBOT_HOST__": html.escape(robot_host(), quote=True),
+        "__SSID__": html.escape(os.getenv("OTTOHABLA_AP_SSID", "R-network")),
+        "__PSK__": html.escape(os.getenv("OTTOHABLA_AP_PSK", "").strip() or "(configurada localmente)"),
+        "__LAN_URL__": html.escape(lan_url),
+    }
+    for marker, value in replacements.items():
+        page = page.replace(marker, value)
+    return page.encode("utf-8")
+
+
+def qr_png() -> bytes:
+    import qrcode
+
+    host = os.getenv("OTTOHABLA_URL_HOST", os.getenv("OTTOHABLA_HOST", "127.0.0.1"))
+    port = int(os.getenv("OTTOHABLA_PORT", "8000"))
+    url = os.getenv("OTTOHABLA_LAN_URL", f"http://{host}:{port}")
+    image = qrcode.make(url)
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
+def copy_to_robot(local_path: Path, remote_path: str) -> None:
+    result = subprocess.run(
+        ssh_command(robot_host(), robot_key(), f"cat > {shlex.quote(remote_path)}"),
+        input=local_path.read_bytes(),
+        capture_output=True,
         timeout=20,
     )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(detail or "No pude enviar el archivo al robot por SSH.")
 
 
-def scp_from_robot(remote_path: str, local_path: Path) -> None:
-    host = robot_host()
-    run_checked(
-        [
-            "scp",
-            "-i",
-            str(DEFAULT_G1_KEY),
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=no",
-            f"{host}:{remote_path}",
-            str(local_path),
-        ],
+def copy_from_robot(remote_path: str, local_path: Path) -> None:
+    result = subprocess.run(
+        ssh_command(robot_host(), robot_key(), f"cat {shlex.quote(remote_path)}"),
+        capture_output=True,
         timeout=30,
     )
+    if result.returncode != 0:
+        detail = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(detail or "No pude traer el archivo desde el robot por SSH.")
+    local_path.write_bytes(result.stdout)
 
 
 def transcribe_audio(path: Path) -> str:
@@ -497,18 +613,18 @@ def start_mic(min_confidence: float = 0.55) -> None:
 
     remote_script = "/tmp/ottohabla_record_mic.py"
     remote_wav = f"/tmp/ottohabla_mic_{uuid.uuid4().hex}.wav"
-    scp_to_robot(ROOT / "scripts" / "remote_record_g1_mic.py", remote_script)
+    copy_to_robot(ROOT / "scripts" / "remote_record_g1_mic.py", remote_script)
     run_checked(
         ssh_command(
             robot_host(),
-            DEFAULT_G1_KEY,
+            robot_key(),
             f"pkill -f {remote_script} || true; chmod +x {remote_script}",
         ),
         timeout=10,
     )
     remote_command = f"exec python3 {remote_script} {remote_wav}"
     proc = subprocess.Popen(
-        ssh_command(robot_host(), DEFAULT_G1_KEY, remote_command),
+        ssh_command(robot_host(), robot_key(), remote_command),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -546,7 +662,7 @@ def stop_mic() -> str:
         except subprocess.TimeoutExpired:
             proc.kill()
     run_checked(
-        ssh_command(robot_host(), DEFAULT_G1_KEY, "pkill -f /tmp/ottohabla_record_mic.py || true"),
+        ssh_command(robot_host(), robot_key(), "pkill -f /tmp/ottohabla_record_mic.py || true"),
         timeout=10,
     )
     if isinstance(thread, threading.Thread):
@@ -555,7 +671,7 @@ def stop_mic() -> str:
     log("Microfono cerrado.")
     with tempfile.TemporaryDirectory() as temp_dir:
         local_wav = Path(temp_dir) / "g1_mic.wav"
-        scp_from_robot(remote_wav, local_wav)
+        copy_from_robot(remote_wav, local_wav)
         size = local_wav.stat().st_size
         log(f"Audio capturado: {size} bytes. Transcribiendo...")
         if size < 8000:
@@ -570,436 +686,6 @@ def stop_mic() -> str:
     return text
 
 
-HTML = r"""<!doctype html>
-<html lang="es">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Otto-Man</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f5f7f9;
-      --panel: #ffffff;
-      --ink: #17202a;
-      --muted: #637083;
-      --line: #d9e0e7;
-      --accent: #087f8c;
-      --accent-strong: #066773;
-      --danger: #b42318;
-      --ok: #147a3f;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "Segoe UI", system-ui, sans-serif;
-      color: var(--ink);
-      background: var(--bg);
-    }
-    header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 18px 24px;
-      border-bottom: 1px solid var(--line);
-      background: var(--panel);
-    }
-    h1 { margin: 0; font-size: 20px; font-weight: 650; }
-    .status { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-    .pill {
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 6px 10px;
-      font-size: 12px;
-      color: var(--muted);
-      background: #fafbfc;
-      white-space: nowrap;
-    }
-    .pill.ok { color: var(--ok); border-color: #b8dec7; background: #eef8f2; }
-    .pill.bad { color: var(--danger); border-color: #efc2bd; background: #fff1ef; }
-    main {
-      display: grid;
-      grid-template-columns: minmax(0, 1.1fr) minmax(320px, .9fr);
-      gap: 18px;
-      padding: 18px;
-      max-width: 1180px;
-      margin: 0 auto;
-    }
-    section {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 16px;
-    }
-    h2 { margin: 0 0 12px; font-size: 15px; font-weight: 650; }
-    label { display: block; margin: 12px 0 6px; font-size: 13px; color: var(--muted); }
-    textarea, input, select {
-      width: 100%;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 10px;
-      font: inherit;
-      background: #fff;
-      color: var(--ink);
-    }
-    textarea { min-height: 126px; resize: vertical; }
-    .row { display: grid; grid-template-columns: 1fr 140px; gap: 10px; }
-    .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
-    button {
-      border: 0;
-      border-radius: 6px;
-      padding: 10px 14px;
-      font: inherit;
-      font-weight: 600;
-      color: #fff;
-      background: var(--accent);
-      cursor: pointer;
-    }
-    button.secondary { color: var(--ink); background: #e8edf2; }
-    button.danger { background: var(--danger); color: #fff; }
-    button:disabled { opacity: .55; cursor: wait; }
-    pre {
-      margin: 0;
-      padding: 12px;
-      min-height: 270px;
-      max-height: 520px;
-      overflow: auto;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: #111820;
-      color: #e8f1f5;
-      white-space: pre-wrap;
-      font: 13px/1.45 Consolas, monospace;
-    }
-    .answer {
-      min-height: 96px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 12px;
-      background: #fbfcfd;
-      line-height: 1.45;
-    }
-    @media (max-width: 820px) {
-      header { align-items: flex-start; flex-direction: column; }
-      main { grid-template-columns: 1fr; padding: 12px; }
-      .row { grid-template-columns: 1fr; }
-    }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>Otto-Man</h1>
-    <div class="status">
-      <span id="apiPill" class="pill">API</span>
-      <span id="robotPill" class="pill">Robot</span>
-      <span id="micPill" class="pill">Mic cerrado</span>
-      <span id="busyPill" class="pill">Listo</span>
-    </div>
-  </header>
-  <main>
-    <section>
-      <h2>Conversaci&oacute;n</h2>
-      <label for="apiKey">OpenAI API key</label>
-      <input id="apiKey" type="password" placeholder="sk-proj-..." autocomplete="off" />
-      <label for="robotHost">Robot SSH host</label>
-      <input id="robotHost" value="unitree@192.168.84.233" />
-      <div class="actions">
-        <button class="secondary" id="saveKey">Usar API key</button>
-        <button class="secondary" id="saveHost">Usar host</button>
-        <button class="secondary" id="checkRobot">Probar robot</button>
-      </div>
-
-      <label for="prompt">Texto para Otto-Man</label>
-      <textarea id="prompt">Presentate como Otto-Man en una frase corta.</textarea>
-      <label>Invitados especiales</label>
-      <div class="actions">
-        <button class="secondary preset" data-person="edgardo">Edgardo Defortuna</button>
-        <button class="secondary preset" data-person="carlos">Carlos Ott</button>
-        <button class="secondary preset" data-person="claudio">Claudio Zuchovicki</button>
-        <button class="secondary preset" data-person="saludo_general">Saludo general</button>
-        <button class="secondary preset" data-person="introduccion">Introducci&oacute;n conceptual</button>
-        <button class="secondary preset" data-person="antes_panel">Antes del panel</button>
-        <button class="secondary preset" data-person="despedida">Despedida</button>
-        <button class="secondary preset" data-person="masoero">Dr. H&eacute;ctor Masoero</button>
-      </div>
-      <div class="row">
-        <div>
-          <label for="instructions">Instrucciones GPT</label>
-          <input id="instructions" value="__EVENT_CONTEXT__" />
-        </div>
-        <div>
-          <label for="volume">Voz</label>
-          <select id="volume">
-            <option value="alto" selected>alto</option>
-            <option value="max">max</option>
-            <option value="medio">medio</option>
-            <option value="bajo">bajo</option>
-          </select>
-        </div>
-      </div>
-      <label for="micDevice">Micr&oacute;fono USB de esta PC</label>
-      <select id="micDevice">
-        <option value="">Predeterminado del navegador</option>
-      </select>
-      <label>
-        <input id="reviewTranscript" type="checkbox" checked style="width:auto; margin-right:6px;" />
-        Revisar transcripción antes de responder
-      </label>
-      <div class="actions">
-        <button id="sendText">Enviar texto y hablar</button>
-        <button id="micOpen">Abrir micr&oacute;fono USB</button>
-        <button id="micClose">Cerrar micrófono</button>
-        <button class="secondary" id="sayTest">Probar voz</button>
-        <button class="danger" id="cancelVoice">Cancelar voz</button>
-      </div>
-
-      <label>&Uacute;ltima respuesta</label>
-      <div id="answer" class="answer"></div>
-    </section>
-
-    <section>
-      <h2>Registro</h2>
-      <pre id="log"></pre>
-    </section>
-  </main>
-  <script>
-    const $ = (id) => document.getElementById(id);
-    const controls = ["saveKey", "saveHost", "checkRobot", "sendText", "micOpen", "micClose", "sayTest"];
-    let mediaRecorder = null;
-    let micStream = null;
-    let browserMicOpen = false;
-    let audioContext = null;
-    let sourceNode = null;
-    let processorNode = null;
-    let pcmBuffers = [];
-    let pcmLength = 0;
-    let pcmSampleRate = 16000;
-
-    function setBusy(busy) {
-      for (const id of controls) $(id).disabled = busy && id !== "cancelVoice";
-      $("busyPill").textContent = busy ? "Trabajando" : "Listo";
-      $("busyPill").className = busy ? "pill" : "pill ok";
-    }
-
-    async function api(path, payload = {}) {
-      setBusy(true);
-      try {
-        const typedKey = ($("apiKey")?.value || "").trim();
-        if (typedKey && path !== "/api/key") payload = { ...payload, api_key: typedKey };
-        const res = await fetch(path, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-        const data = await res.json();
-        if (!res.ok || !data.ok) throw new Error(data.error || res.statusText);
-        await refresh();
-        return data;
-      } catch (err) {
-        $("answer").textContent = err.message;
-        await refresh();
-        throw err;
-      } finally {
-        setBusy(false);
-      }
-    }
-
-    async function refresh() {
-      const res = await fetch("/api/status");
-      const data = await res.json();
-      $("apiPill").textContent = data.api_key_set ? "API lista" : "API faltante";
-      $("apiPill").className = data.api_key_set ? "pill ok" : "pill bad";
-      $("robotPill").textContent = data.robot_ok ? "Robot conectado" : "Robot sin probar";
-      $("robotPill").className = data.robot_ok ? "pill ok" : "pill";
-      if (data.robot_host && $("robotHost").value !== data.robot_host) $("robotHost").value = data.robot_host;
-      const anyMicOpen = data.mic_active || data.pc_mic_active || browserMicOpen;
-      $("micPill").textContent = anyMicOpen ? "Mic PC abierto" : "Mic cerrado";
-      $("micPill").className = anyMicOpen ? "pill ok" : "pill";
-      $("busyPill").textContent = data.busy ? "Trabajando" : "Listo";
-      $("busyPill").className = data.busy ? "pill" : "pill ok";
-      for (const id of controls) $(id).disabled = data.busy && id !== "cancelVoice";
-      if (data.last_answer || !data.busy) $("answer").textContent = data.last_answer || "";
-      $("log").textContent = data.logs.join("\n");
-      $("log").scrollTop = $("log").scrollHeight;
-      return data;
-    }
-
-    async function loadMicrophones() {
-      if (!navigator.mediaDevices?.enumerateDevices) return;
-      try {
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const inputs = devices.filter(d => d.kind === "audioinput");
-        $("micDevice").innerHTML = '<option value="">Predeterminado del navegador</option>';
-        for (const d of inputs) {
-          const option = document.createElement("option");
-          option.value = d.deviceId;
-          option.textContent = d.label || `Microfono ${$("micDevice").length}`;
-          if (/fifine|usb pnp|usb/i.test(option.textContent)) option.selected = true;
-          $("micDevice").appendChild(option);
-        }
-      } catch (err) {
-        console.warn(err);
-      }
-    }
-
-    async function openPcMic() {
-      const deviceId = $("micDevice").value;
-      const constraints = {
-        audio: {
-          ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: false,
-          channelCount: 1
-        }
-      };
-      micStream = await navigator.mediaDevices.getUserMedia(constraints);
-      await loadMicrophones();
-      audioContext = new AudioContext();
-      pcmSampleRate = audioContext.sampleRate;
-      pcmBuffers = [];
-      pcmLength = 0;
-      sourceNode = audioContext.createMediaStreamSource(micStream);
-      processorNode = audioContext.createScriptProcessor(4096, 1, 1);
-      processorNode.onaudioprocess = (event) => {
-        const input = event.inputBuffer.getChannelData(0);
-        const copy = new Float32Array(input.length);
-        copy.set(input);
-        pcmBuffers.push(copy);
-        pcmLength += copy.length;
-        event.outputBuffer.getChannelData(0).fill(0);
-      };
-      sourceNode.connect(processorNode);
-      processorNode.connect(audioContext.destination);
-      mediaRecorder = true;
-      browserMicOpen = true;
-      $("micPill").textContent = "Mic PC abierto";
-      $("micPill").className = "pill ok";
-    }
-
-    function encodeWav(buffers, length, sampleRate) {
-      const samples = new Float32Array(length);
-      let offset = 0;
-      for (const buffer of buffers) {
-        samples.set(buffer, offset);
-        offset += buffer.length;
-      }
-      const wav = new ArrayBuffer(44 + samples.length * 2);
-      const view = new DataView(wav);
-      const writeString = (pos, text) => {
-        for (let i = 0; i < text.length; i++) view.setUint8(pos + i, text.charCodeAt(i));
-      };
-      writeString(0, "RIFF");
-      view.setUint32(4, 36 + samples.length * 2, true);
-      writeString(8, "WAVE");
-      writeString(12, "fmt ");
-      view.setUint32(16, 16, true);
-      view.setUint16(20, 1, true);
-      view.setUint16(22, 1, true);
-      view.setUint32(24, sampleRate, true);
-      view.setUint32(28, sampleRate * 2, true);
-      view.setUint16(32, 2, true);
-      view.setUint16(34, 16, true);
-      writeString(36, "data");
-      view.setUint32(40, samples.length * 2, true);
-      let pos = 44;
-      for (let i = 0; i < samples.length; i++, pos += 2) {
-        const sample = Math.max(-1, Math.min(1, samples[i]));
-        view.setInt16(pos, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
-      }
-      return new Blob([view], { type: "audio/wav" });
-    }
-
-    async function closePcMicAndAnswer() {
-      if (!mediaRecorder) throw new Error("El microfono de la PC no esta abierto.");
-      processorNode.disconnect();
-      sourceNode?.disconnect();
-      if (micStream) micStream.getTracks().forEach(track => track.stop());
-      await audioContext.close();
-      micStream = null;
-      browserMicOpen = false;
-      mediaRecorder = null;
-      processorNode = null;
-      sourceNode = null;
-      audioContext = null;
-      const blob = encodeWav(pcmBuffers, pcmLength, pcmSampleRate);
-      pcmBuffers = [];
-      pcmLength = 0;
-      const dataUrl = await new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result);
-        reader.onerror = reject;
-        reader.readAsDataURL(blob);
-      });
-      const [, encoded] = String(dataUrl).split(",", 2);
-      $("micPill").textContent = "Transcribiendo";
-      $("micPill").className = "pill";
-      await api("/api/pc-audio", {
-        audio_base64: encoded,
-        mime_type: "audio/wav",
-        instructions: $("instructions").value,
-        volume: $("volume").value,
-        review_only: $("reviewTranscript").checked
-      });
-      const data = await refresh();
-      if (data.last_user && $("reviewTranscript").checked) {
-        $("prompt").value = data.last_user;
-        $("answer").textContent = "Transcripción lista. Revisala y tocá Enviar texto y hablar.";
-      }
-    }
-
-    $("saveKey").onclick = async () => {
-      await api("/api/key", { api_key: $("apiKey").value });
-      $("apiKey").value = "";
-    };
-    $("saveHost").onclick = async () => api("/api/host", { robot_host: $("robotHost").value });
-    $("checkRobot").onclick = async () => api("/api/check-robot");
-    $("cancelVoice").onclick = async () => {
-      try {
-        const res = await fetch("/api/cancel-voice", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-        const data = await res.json();
-        if (!res.ok || !data.ok) throw new Error(data.error || res.statusText);
-        await refresh();
-      } catch (err) {
-        $("answer").textContent = err.message;
-      }
-    };
-    $("sayTest").onclick = async () => api("/api/say", {
-      text: "Hola, soy Otto-Man. La voz esta lista.",
-      volume: $("volume").value
-    });
-    document.querySelectorAll(".preset").forEach((button) => {
-      button.onclick = async () => api("/api/person", {
-        person: button.dataset.person,
-        volume: $("volume").value
-      });
-    });
-    $("sendText").onclick = async () => api("/api/text", {
-      text: $("prompt").value,
-      instructions: $("instructions").value,
-      volume: $("volume").value
-    });
-    $("micOpen").onclick = async () => {
-      setBusy(true);
-      try {
-        await openPcMic();
-      } catch (err) {
-        $("answer").textContent = err.message;
-      } finally {
-        setBusy(false);
-      }
-    };
-    $("micClose").onclick = async () => closePcMicAndAnswer();
-
-    refresh();
-    loadMicrophones();
-    setInterval(refresh, 1500);
-  </script>
-</body>
-</html>
-"""
-
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:
@@ -1008,14 +694,27 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/":
-            page = HTML.replace("__EVENT_CONTEXT__", html.escape(EVENT_CONTEXT, quote=True))
-            body = page.encode("utf-8")
+            body = render_ui()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store, max-age=0")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if parsed.path == "/qr.png":
+            body = qr_png()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Cache-Control", "no-store, max-age=0")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if parsed.path == "/api/presets":
+            with LOCK:
+                items = list(STATE.get("presets") or [])
+            send_json(self, 200, {"ok": True, "presets": items})
             return
         if parsed.path == "/api/status":
             with LOCK:
@@ -1032,6 +731,50 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             payload = get_json(self)
+
+            if parsed.path == "/api/presets-refresh":
+                items = refresh_presets()
+                send_json(self, 200, {"ok": True, "presets": items})
+                return
+
+            if parsed.path == "/api/preset-save":
+                start_busy_action()
+                set_phase("Generando audio")
+                name = validate_preset_name((payload.get("name") or "").strip())
+                text = (payload.get("text") or "").strip()
+                if not text:
+                    raise ValueError("El texto del preset está vacío.")
+                args = ["save", name]
+                if payload.get("overwrite"):
+                    args.append("--force")
+                run_remote_preset(*args, input_text=text, timeout=120)
+                items = refresh_presets()
+                log(f"Preset guardado: {name}")
+                send_json(self, 200, {"ok": True, "name": name, "presets": items})
+                return
+
+            if parsed.path == "/api/preset-play":
+                start_busy_action()
+                set_phase("Hablando")
+                name = validate_preset_name((payload.get("name") or "").strip())
+                volume = (payload.get("volume") or "alto").strip()
+                if volume not in {"bajo", "medio", "alto", "max"}:
+                    raise ValueError("Volumen inválido.")
+                with SPEAK_LOCK:
+                    run_remote_preset("play", name, volume, timeout=120)
+                log(f"Preset reproducido: {name} ({volume})")
+                send_json(self, 200, {"ok": True, "name": name})
+                return
+
+            if parsed.path == "/api/preset-delete":
+                start_busy_action()
+                set_phase("Borrando audio")
+                name = validate_preset_name((payload.get("name") or "").strip())
+                run_remote_preset("delete", name, timeout=30)
+                items = refresh_presets()
+                log(f"Preset borrado: {name}")
+                send_json(self, 200, {"ok": True, "name": name, "presets": items})
+                return
 
             if parsed.path == "/api/key":
                 key = (payload.get("api_key") or "").strip()
@@ -1067,7 +810,7 @@ class Handler(BaseHTTPRequestHandler):
 
             if parsed.path == "/api/cancel-voice":
                 detail = cancel_robot_voice()
-                set_busy(False)
+                force_clear_busy()
                 log(f"Voz cancelada: {detail}")
                 send_json(self, 200, {"ok": True, "detail": detail})
                 return
@@ -1128,6 +871,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/pc-mic-stop":
                 start_busy_action()
                 wav_path = stop_pc_mic()
+                set_phase("Transcribiendo")
                 log("Transcribiendo microfono PC...")
                 user_text = validate_transcription(transcribe_audio(wav_path))
                 log(f"Mic PC => {user_text}")
@@ -1236,9 +980,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
+    host = os.getenv("OTTOHABLA_HOST", "127.0.0.1")
     port = int(os.getenv("OTTOHABLA_PORT", "8000"))
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    log(f"Mini app lista en http://127.0.0.1:{port}")
+    server = ThreadingHTTPServer((host, port), Handler)
+    server.daemon_threads = True
+    log(f"OttoHabla listo en http://{host}:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

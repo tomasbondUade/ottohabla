@@ -18,6 +18,14 @@ DEFAULT_MODEL = "gpt-5.6"
 DEFAULT_G1_HOST = "unitree@192.168.123.164"
 DEFAULT_G1_KEY = Path.home() / ".ssh" / "ottohabla_g1"
 DEFAULT_OTTO_SAY = "/home/unitree/Desktop/teo_Ottoguide_IA/ottoguide-ia/src/otto_audio/scripts/otto_say.sh"
+SSH_MUX_OPTS = [
+    "-o",
+    "ControlMaster=auto",
+    "-o",
+    "ControlPath=/tmp/ottohabla-ssh-%C",
+    "-o",
+    "ControlPersist=10m",
+]
 DEFAULT_INSTRUCTIONS = (
     "Sos Otto-Man, un robot Unitree G1. Respondé en español rioplatense, "
     "con frases cortas, claras y naturales para decir en voz alta. "
@@ -206,6 +214,7 @@ def speak_with_remote_piper(text: str, host: str, identity_file: Path, otto_say:
             "ConnectTimeout=5",
             "-o",
             "StrictHostKeyChecking=no",
+            *SSH_MUX_OPTS,
             host,
             remote_command,
         ]

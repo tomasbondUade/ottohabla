@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -74,19 +75,15 @@ def main() -> int:
             str(args.identity_file),
             args.host,
         ]
-        scp_base = [
-            "scp",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-i",
-            str(args.identity_file),
-        ]
-
         print(f"Creating remote directory {args.remote_dir}")
-        run([*ssh_base, f"mkdir -p {args.remote_dir}"])
+        run([*ssh_base, f"mkdir -p {shlex.quote(args.remote_dir)}"])
 
-        print(f"Copying {playable} to {args.host}:{remote_path}")
-        run([*scp_base, str(playable), f"{args.host}:{remote_path}"])
+        print(f"Streaming {playable} to {args.host}:{remote_path}")
+        subprocess.run(
+            [*ssh_base, f"cat > {shlex.quote(remote_path)}"],
+            input=playable.read_bytes(),
+            check=True,
+        )
 
         print("Playing through robot-local AudioClient")
         run([*ssh_base, args.remote_bin, args.remote_interface, remote_path, str(args.volume)])
