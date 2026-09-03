@@ -989,6 +989,12 @@ def main() -> int:
         server.serve_forever()
     except KeyboardInterrupt:
         log("Servidor detenido.")
+    finally:
+        if MIC["active"]:
+            try:
+                stop_mic()
+            except Exception as exc:
+                log(f"No se pudo detener el microfono del robot al salir: {exc}")
     return 0
 
 
