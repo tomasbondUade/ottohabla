@@ -147,16 +147,6 @@ MIC = {
     "texts": [],
     "remote_wav": "",
 }
-PC_MIC = {
-    "active": False,
-    "stream": None,
-    "proc": None,
-    "wav_path": None,
-    "frames": bytearray(),
-    "sample_rate": 16000,
-    "channels": 1,
-    "device": None,
-}
 LOCK = threading.Lock()
 SPEAK_LOCK = threading.Lock()
 BUSY_OWNER = threading.local()
@@ -500,91 +490,6 @@ def validate_transcription(text: str) -> str:
     return text
 
 
-def find_pc_mic_device() -> int | None:
-    import sounddevice as sd
-
-    devices = sd.query_devices()
-    for index, device in enumerate(devices):
-        name = str(device.get("name", "")).lower()
-        if device.get("max_input_channels", 0) > 0 and ("usb pnp" in name or "fifine" in name):
-            return index
-    default_input = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
-    return int(default_input) if default_input is not None and default_input >= 0 else None
-
-
-def start_pc_mic() -> None:
-    with LOCK:
-        if PC_MIC["active"]:
-            raise RuntimeError("El microfono de la PC ya esta abierto.")
-        PC_MIC["frames"] = bytearray()
-
-    temp_dir = Path(tempfile.mkdtemp(prefix="ottohabla_pc_mic_live_"))
-    wav_path = temp_dir / "pc_mic.wav"
-    recorder_code = (
-        "import sys; "
-        f"sys.path.insert(0, {str(SCRIPTS)!r}); "
-        "import record_pc_mic; "
-        "sys.argv = ['record_pc_mic.py', sys.argv[1]]; "
-        "raise SystemExit(record_pc_mic.main())"
-    )
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            recorder_code,
-            str(wav_path),
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    time.sleep(0.6)
-    if proc.poll() is not None:
-        output = proc.stdout.read() if proc.stdout else ""
-        raise RuntimeError(f"No pude abrir el microfono de la PC: {output.strip()}")
-
-    with LOCK:
-        PC_MIC["active"] = True
-        PC_MIC["proc"] = proc
-        PC_MIC["wav_path"] = wav_path
-    log("Microfono PC abierto con grabador local.")
-
-
-def stop_pc_mic() -> Path:
-    with LOCK:
-        if not PC_MIC["active"]:
-            raise RuntimeError("El microfono de la PC no esta abierto.")
-        proc = PC_MIC["proc"]
-        wav_path = PC_MIC["wav_path"]
-        PC_MIC["active"] = False
-        PC_MIC["proc"] = None
-        PC_MIC["wav_path"] = None
-        PC_MIC["frames"] = bytearray()
-
-    if isinstance(proc, subprocess.Popen):
-        if proc.stdin:
-            proc.stdin.write("stop\n")
-            proc.stdin.flush()
-        try:
-            stdout, _stderr = proc.communicate(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, _stderr = proc.communicate(timeout=1)
-        if stdout:
-            for line in stdout.splitlines():
-                log(line)
-
-    if not isinstance(wav_path, Path) or not wav_path.exists():
-        raise RuntimeError("No se genero el WAV del microfono.")
-    if wav_path.stat().st_size < 4000:
-        raise RuntimeError("El audio grabado es demasiado corto.")
-
-    log(f"Microfono PC cerrado. WAV: {wav_path} ({wav_path.stat().st_size} bytes).")
-    return wav_path
-
 
 def _mic_reader(proc: subprocess.Popen[str], min_confidence: float) -> None:
     assert proc.stdout is not None
@@ -720,7 +625,6 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 payload = dict(STATE)
                 payload["mic_active"] = bool(MIC["active"])
-                payload["pc_mic_active"] = bool(PC_MIC["active"])
                 payload["mic_text"] = " ".join(MIC["texts"])
             payload["robot_ok"] = bool(STATE.get("robot_ok"))
             send_json(self, 200, payload)
@@ -861,30 +765,6 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/mic-start":
                 start_mic()
                 send_json(self, 200, {"ok": True})
-                return
-
-            if parsed.path == "/api/pc-mic-start":
-                start_pc_mic()
-                send_json(self, 200, {"ok": True})
-                return
-
-            if parsed.path == "/api/pc-mic-stop":
-                start_busy_action()
-                wav_path = stop_pc_mic()
-                set_phase("Transcribiendo")
-                log("Transcribiendo microfono PC...")
-                user_text = validate_transcription(transcribe_audio(wav_path))
-                log(f"Mic PC => {user_text}")
-                answer = ask_and_speak(
-                    user_text,
-                    payload.get("volume") or "alto",
-                    payload.get("instructions") or EVENT_CONTEXT,
-                    DEFAULT_MODEL,
-                )
-                with LOCK:
-                    STATE["last_user"] = user_text
-                    STATE["last_answer"] = answer
-                send_json(self, 200, {"ok": True, "user_text": user_text, "answer": answer})
                 return
 
             if parsed.path == "/api/mic-stop":

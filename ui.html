@@ -633,12 +633,12 @@
 
     async function toggleMic() {
       if (micOpen) {
-        await api("/api/pc-mic-stop", {
+        await api("/api/mic-stop", {
           instructions: $("instructions").value,
           volume: $("volume").value
         });
       } else {
-        await api("/api/pc-mic-start");
+        await api("/api/mic-start");
       }
     }
     $("micBtn").onclick = toggleMic;
@@ -671,7 +671,7 @@
           $("robotHost").value = data.robot_host;
         }
 
-        const open = Boolean(data.pc_mic_active);
+        const open = Boolean(data.mic_active);
         if (open !== micOpen) paintMic(open);
 
         // Un pill que dice en qué paso está: sin esto el botón queda mudo 10 segundos.

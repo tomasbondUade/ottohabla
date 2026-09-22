@@ -35,6 +35,9 @@ python3 -m unittest discover -s tests -v
 
 - `app.py`: backend HTTP, integración OpenAI y operaciones SSH.
 - `ui.html`: interfaz única para notebook/celular.
-- `scripts/record_pc_mic.py`: captura el FIFINE local.
+- `scripts/remote_record_g1_mic.py`: graba el mic USB-C del robot (AB13X)
+  vía SSH, corrido remotamente por `start_mic`/`stop_mic` en `app.py`.
+- `scripts/legacy/record_pc_mic.py`: captura del FIFINE de la notebook —
+  retirado el 2026-09-22, el mic ahora vive en el robot.
 - `scripts/ask_gpt_and_speak.py`: Responses API y voz remota mediante Piper.
 - `scripts/otto_preset.sh`: administración de audios pregrabados dentro del robot.
