@@ -147,6 +147,21 @@ MIC = {
     "texts": [],
     "remote_wav": "",
 }
+# Script de grabación que se copia al robot y graba del mic USB-C (AB13X).
+REMOTE_MIC_SCRIPT = "/tmp/ottohabla_record_mic.py"
+# Patrón para pkill con el truco del corchete: el regex "[o]ttohabla..." matchea
+# "ottohabla..." en la línea de comando del grabador, pero la línea de comando del
+# propio shell remoto (que contiene "[o]ttohabla...") NO matchea. Sin esto, pkill
+# se mata a sí mismo, la sesión SSH muere y devuelve 255 -- mismo gotcha ya
+# documentado para otto_pipeline en ARQUITECTURA.md. Diagnosticado el 2026-09-23,
+# rompía /api/mic-start y /api/mic-stop enteros.
+# IMPORTANTE: va entre comillas simples al usarlo, si no el shell remoto expande
+# el corchete como glob y vuelve a aparecer el path literal.
+REMOTE_MIC_PKILL_PATTERN = "/tmp/[o]ttohabla_record_mic.py"
+# Estado del pipeline de wake word. Lo refresca _pipeline_watcher() en un hilo
+# aparte; /api/status solo lo lee de memoria (ver comentario en el watcher).
+PIPELINE_STATUS = {"running": False, "ready": False}
+PIPELINE_POLL_SECS = 5.0
 LOCK = threading.Lock()
 SPEAK_LOCK = threading.Lock()
 BUSY_OWNER = threading.local()
@@ -516,18 +531,21 @@ def start_mic(min_confidence: float = 0.55) -> None:
             raise RuntimeError("El microfono ya esta abierto.")
         MIC["texts"] = []
 
-    remote_script = "/tmp/ottohabla_record_mic.py"
     remote_wav = f"/tmp/ottohabla_mic_{uuid.uuid4().hex}.wav"
-    copy_to_robot(ROOT / "scripts" / "remote_record_g1_mic.py", remote_script)
+    copy_to_robot(ROOT / "scripts" / "remote_record_g1_mic.py", REMOTE_MIC_SCRIPT)
+    # Limpiar un grabador que haya quedado colgado de una sesión anterior.
+    # No se hace chmod +x: el script se invoca como `python3 archivo`, el bit de
+    # ejecución no juega, y tener el path literal en este mismo comando rompía
+    # el truco del corchete (ver REMOTE_MIC_PKILL_PATTERN).
     run_checked(
         ssh_command(
             robot_host(),
             robot_key(),
-            f"pkill -f {remote_script} || true; chmod +x {remote_script}",
+            f"pkill -f '{REMOTE_MIC_PKILL_PATTERN}' || true",
         ),
         timeout=10,
     )
-    remote_command = f"exec python3 {remote_script} {remote_wav}"
+    remote_command = f"exec python3 {REMOTE_MIC_SCRIPT} {remote_wav}"
     proc = subprocess.Popen(
         ssh_command(robot_host(), robot_key(), remote_command),
         stdout=subprocess.PIPE,
@@ -567,7 +585,11 @@ def stop_mic() -> str:
         except subprocess.TimeoutExpired:
             proc.kill()
     run_checked(
-        ssh_command(robot_host(), robot_key(), "pkill -f /tmp/ottohabla_record_mic.py || true"),
+        ssh_command(
+            robot_host(),
+            robot_key(),
+            f"pkill -f '{REMOTE_MIC_PKILL_PATTERN}' || true",
+        ),
         timeout=10,
     )
     if isinstance(thread, threading.Thread):
@@ -590,6 +612,86 @@ def stop_mic() -> str:
         raise RuntimeError("No se detecto texto desde el microfono.")
     return text
 
+
+# ── Pipeline de wake word ("Hola Otto") corriendo en el robot ────────────────
+# Rutas fijas en el robot (ver SHPR-Ottoman-FAIN/ARQUITECTURA.md, "Constantes
+# compartidas"). El binario lo compila ottoguide-ia en el robot.
+OTTO_PIPELINE_BIN = (
+    "/home/unitree/Desktop/teo_Ottoguide_IA/ottoguide-ia/src/otto_audio/cpp/build/otto_pipeline"
+)
+OTTO_PIPELINE_PID = "/tmp/otto_pipeline.pid"
+OTTO_PIPELINE_LOG = "/tmp/otto_pipeline.log"
+# Patrón con el truco del corchete, igual que REMOTE_MIC_PKILL_PATTERN: solo se
+# usa como respaldo si no hay PID file (por ejemplo si alguien lanzó el pipeline
+# a mano desde una terminal).
+OTTO_PIPELINE_PKILL_PATTERN = "/build/[o]tto_pipeline"
+
+
+def query_otto_pipeline_status() -> dict:
+    """Consulta por SSH si el pipeline está vivo y si ya terminó de cargar.
+
+    running: el PID del PID file sigue vivo (o hay un proceso suelto).
+    ready: ya cargó Whisper y está esperando "Hola Otto" (banner en el log).
+    """
+    command = (
+        f"if [ -f {OTTO_PIPELINE_PID} ] && kill -0 \"$(cat {OTTO_PIPELINE_PID} 2>/dev/null)\" 2>/dev/null; "
+        f"then echo running; "
+        f"elif pgrep -f '{OTTO_PIPELINE_PKILL_PATTERN}' >/dev/null 2>&1; then echo running; "
+        f"else echo stopped; fi; "
+        f"grep -q HIBERNACION {OTTO_PIPELINE_LOG} 2>/dev/null && echo ready || echo loading"
+    )
+    out = run_ssh(command, timeout=8).stdout
+    running = "running" in out
+    return {"running": running, "ready": running and "ready" in out}
+
+
+def _pipeline_watcher() -> None:
+    """Refresca PIPELINE_STATUS en segundo plano.
+
+    A propósito NO se consulta dentro de /api/status: la web pollea cada 1.5s y
+    un SSH lento (o el robot caído) congelaría la interfaz. Acá el estado se
+    lee siempre de memoria, instantáneo, y este hilo lo actualiza aparte.
+    """
+    while True:
+        try:
+            value = query_otto_pipeline_status()
+        except Exception:
+            value = {"running": False, "ready": False}
+        with LOCK:
+            PIPELINE_STATUS.update(value)
+        time.sleep(PIPELINE_POLL_SECS)
+
+
+def start_otto_pipeline() -> None:
+    if query_otto_pipeline_status()["running"]:
+        raise RuntimeError("El pipeline de Hola Otto ya está corriendo en el robot.")
+    # stdin a /dev/null: sin eso la sesión SSH queda colgada esperando que el
+    # proceso hijo suelte el descriptor (gotcha documentado en ARQUITECTURA.md).
+    command = (
+        f"nohup {OTTO_PIPELINE_BIN} < /dev/null > {OTTO_PIPELINE_LOG} 2>&1 & "
+        f"echo $! > {OTTO_PIPELINE_PID}"
+    )
+    run_ssh(command, timeout=20)
+    with LOCK:
+        PIPELINE_STATUS.update({"running": True, "ready": False})
+    log("Pipeline de Hola Otto lanzado. Tarda ~20s en cargar Whisper antes de escuchar.")
+
+
+def stop_otto_pipeline() -> None:
+    # Matar por PID puntual. NUNCA `pkill -f otto_pipeline` a secas: el patrón
+    # aparece en la propia línea de comando remota y pkill se mata a sí mismo
+    # (gotcha ya documentado, y volvió a morder con el grabador de mic el
+    # 2026-09-23). El respaldo usa el patrón con corchete.
+    command = (
+        f"if [ -f {OTTO_PIPELINE_PID} ]; then "
+        f"kill \"$(cat {OTTO_PIPELINE_PID})\" 2>/dev/null || true; "
+        f"rm -f {OTTO_PIPELINE_PID}; "
+        f"else pkill -f '{OTTO_PIPELINE_PKILL_PATTERN}' || true; fi"
+    )
+    run_ssh(command, timeout=15)
+    with LOCK:
+        PIPELINE_STATUS.update({"running": False, "ready": False})
+    log("Pipeline de Hola Otto detenido.")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -626,6 +728,8 @@ class Handler(BaseHTTPRequestHandler):
                 payload = dict(STATE)
                 payload["mic_active"] = bool(MIC["active"])
                 payload["mic_text"] = " ".join(MIC["texts"])
+                payload["pipeline_running"] = bool(PIPELINE_STATUS["running"])
+                payload["pipeline_ready"] = bool(PIPELINE_STATUS["ready"])
             payload["robot_ok"] = bool(STATE.get("robot_ok"))
             send_json(self, 200, payload)
             return
@@ -762,6 +866,16 @@ class Handler(BaseHTTPRequestHandler):
                 send_json(self, 200, {"ok": True, "answer": answer})
                 return
 
+            if parsed.path == "/api/pipeline-start":
+                start_otto_pipeline()
+                send_json(self, 200, {"ok": True})
+                return
+
+            if parsed.path == "/api/pipeline-stop":
+                stop_otto_pipeline()
+                send_json(self, 200, {"ok": True})
+                return
+
             if parsed.path == "/api/mic-start":
                 start_mic()
                 send_json(self, 200, {"ok": True})
@@ -864,6 +978,7 @@ def main() -> int:
     port = int(os.getenv("OTTOHABLA_PORT", "8000"))
     server = ThreadingHTTPServer((host, port), Handler)
     server.daemon_threads = True
+    threading.Thread(target=_pipeline_watcher, daemon=True).start()
     log(f"OttoHabla listo en http://{host}:{port}")
     try:
         server.serve_forever()

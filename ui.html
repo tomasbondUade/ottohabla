@@ -320,8 +320,12 @@
       background: var(--panel);
     }
     .dock #micBtn { flex: 1; min-height: 42px; }
+    .dock #pipelineBtn { flex: 1; min-height: 42px; }
     .dock select { width: auto; min-width: 96px; min-height: 42px; font-size: 14px; padding: 6px 10px; flex: none; }
     #micBtn.rec { background: var(--danger); color: #fff; }
+    /* Pipeline de "Hola Otto": amarillo mientras carga Whisper (~20s), verde ya escuchando. */
+    #pipelineBtn.loading { background: var(--warn, #b8860b); color: #fff; }
+    #pipelineBtn.on { background: var(--ok, #2e7d32); color: #fff; }
   </style>
 </head>
 <body>
@@ -433,6 +437,7 @@
   </main>
 
   <div class="dock">
+    <button id="pipelineBtn" class="secondary">Hola Otto</button>
     <button id="micBtn">Abrir micrófono</button>
     <select id="volume" aria-label="Volumen">
       <option value="alto" selected>alto</option>
@@ -445,6 +450,7 @@
   <script>
     const $ = (id) => document.getElementById(id);
     let micOpen = false;
+    let pipelineRunning = false;
     let busy = false;
     let presets = [];
 
@@ -643,6 +649,21 @@
     }
     $("micBtn").onclick = toggleMic;
 
+    /* ── Pipeline "Hola Otto" (wake word en el robot) ──────── */
+    // running sin ready = está cargando Whisper en la GPU (~20s), todavía no escucha.
+    function paintPipeline(running, ready) {
+      pipelineRunning = running;
+      const btn = $("pipelineBtn");
+      btn.textContent = !running ? "Hola Otto" : (ready ? "Hola Otto: escuchando" : "Hola Otto: cargando…");
+      btn.classList.toggle("on", running && ready);
+      btn.classList.toggle("loading", running && !ready);
+    }
+
+    async function togglePipeline() {
+      await api(pipelineRunning ? "/api/pipeline-stop" : "/api/pipeline-start");
+    }
+    $("pipelineBtn").onclick = togglePipeline;
+
     /* ── Config ───────────────────────────────────────────── */
     $("sendText").onclick = sendText;
     $("saveKey").onclick = async () => {
@@ -673,6 +694,8 @@
 
         const open = Boolean(data.mic_active);
         if (open !== micOpen) paintMic(open);
+
+        paintPipeline(Boolean(data.pipeline_running), Boolean(data.pipeline_ready));
 
         // Un pill que dice en qué paso está: sin esto el botón queda mudo 10 segundos.
         const pill = $("busyPill");
