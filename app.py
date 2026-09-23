@@ -161,7 +161,19 @@ REMOTE_MIC_PKILL_PATTERN = "/tmp/[o]ttohabla_record_mic.py"
 # Estado del pipeline de wake word. Lo refresca _pipeline_watcher() en un hilo
 # aparte; /api/status solo lo lee de memoria (ver comentario en el watcher).
 PIPELINE_STATUS = {"running": False, "ready": False}
+# Ultimas lineas del stdout del pipeline en el robot, ya sin colores ANSI. Es
+# la misma traza que se ve al levantar otto_pipeline a mano en una terminal:
+# [STT], [LLM], [TTS], [TIEMPO], [FILTRO], los cambios de estado. La pestana
+# Registro de la web la muestra tal cual para poder seguir cada paso sin
+# tener que abrir un SSH.
+PIPELINE_TRACE = {"lines": [], "note": ""}
+PIPELINE_TAIL_LINES = 400
+# Dos ritmos: si el pipeline esta corriendo se pollea seguido para que el
+# Registro se sienta como la terminal del robot; si esta parado no hay nada
+# que mirar y no vale la pena el SSH.
 PIPELINE_POLL_SECS = 5.0
+PIPELINE_POLL_SECS_ACTIVO = 2.0
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 LOCK = threading.Lock()
 SPEAK_LOCK = threading.Lock()
 BUSY_OWNER = threading.local()
@@ -488,6 +500,37 @@ def copy_from_robot(remote_path: str, local_path: Path) -> None:
     local_path.write_bytes(result.stdout)
 
 
+# "UADE" es la palabra que peor transcribe cualquier ASR (Whisper local en el
+# robot y whisper-1 de OpenAI por igual): es una sigla que en espanol se
+# pronuncia como una palabra, asi que vuelve escrita "uade", "Uade", "uate",
+# "U.A.D.E.", "u a de", "guade"... Si la pregunta llega al modelo sin la sigla,
+# el modelo no sabe de que universidad le hablan y contesta cualquier cosa.
+#
+# Gemela de corregir_uade() en
+# ottoguide-ia/src/otto_audio/cpp/otto_pipeline.cpp -- si se agrega una variante
+# aca, agregarla alla tambien.
+# \W{0,2} tolera el separador de las formas deletreadas ("u a de", "U.A.D.E.")
+# sin permitir que el patron salte a la palabra siguiente: exige que las letras
+# esten pegadas salvo por uno o dos caracteres que no sean letra.
+UADE_VARIANTES = re.compile(
+    r"\b(?:"
+    r"u\W{0,2}a\W{0,2}d\W{0,2}[e\u00e9]"   # uade, u a de, ua de, u ade, u.a.d.e
+    r"|u\W{0,2}a\W{0,2}t[e\u00e9]"          # uate
+    r"|u\W{0,2}a\W{0,2}g[e\u00e9]"          # uage
+    r"|uad[i\u00ed]|uader|uad"
+    r"|uh\W{0,2}ad[e\u00e9]"
+    r"|[pwgbhj]uad[e\u00e9]"                # puade, wuade, guade, buade...
+    r"|ud[e\u00e9]"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def corregir_uade(text: str) -> str:
+    """Deja la sigla UADE en su forma canonica, sin tocar el resto del texto."""
+    return UADE_VARIANTES.sub("UADE", text)
+
+
 def transcribe_audio(path: Path) -> str:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -507,10 +550,10 @@ def transcribe_audio(path: Path) -> str:
         "es\r\n",
         f"--{boundary}\r\n"
         'Content-Disposition: form-data; name="prompt"\r\n\r\n'
-        "Evento UADE El Nuevo Mapa del Capital. Otto-Man. "
-        "Economia, arquitectura, real estate, inversiones, ciudades, "
-        "Edgardo Defortuna, Carlos Ott, Claudio Zuchovicki, Hector Masoero. "
-        "Transcribir solo la pregunta hablada en espanol rioplatense; ignorar ruido, musica, subtitulos y audio de fondo.\r\n",
+        "Conversaci\u00f3n en la UADE, la Universidad Argentina de la Empresa. "
+        "Otto es el robot humanoide de UADE. "
+        "Preguntas sobre carreras, campus, Bedel\u00eda e ingreso a UADE. "
+        "Transcribir solo la pregunta hablada en espa\u00f1ol rioplatense; ignorar ruido, musica, subtitulos y audio de fondo.\r\n",
         f"--{boundary}\r\n"
         'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
         f"Content-Type: {content_type}\r\n\r\n",
@@ -539,7 +582,7 @@ def transcribe_audio(path: Path) -> str:
     text = (data.get("text") or "").strip()
     if not text:
         raise RuntimeError("La transcripcion volvio vacia.")
-    return text
+    return corregir_uade(text)
 
 
 def validate_transcription(text: str) -> str:
@@ -692,22 +735,53 @@ OTTO_PIPELINE_LOG = "/tmp/otto_pipeline.log"
 OTTO_PIPELINE_PKILL_PATTERN = "/build/[o]tto_pipeline"
 
 
+def strip_ansi(text: str) -> str:
+    """Saca los colores ANSI que otto_pipeline usa para la terminal.
+
+    El pipeline imprime con escapes (C_YELLOW, C_GRAY...). En un <pre> del
+    navegador esos escapes se verían como basura, así que se limpian acá y la
+    web vuelve a colorear por el tag de cada línea ([STT], [LLM], ...).
+    """
+    # Se saca todo \r, no solo el del final: print_indicador() del pipeline
+    # escribe "\r[◯] HIBERNACION..." para sobreescribir la linea en la terminal,
+    # y en un <pre> ese \r al principio ensucia el renderizado.
+    return ANSI_RE.sub("", text).replace("\r", "")
+
+
 def query_otto_pipeline_status() -> dict:
-    """Consulta por SSH si el pipeline está vivo y si ya terminó de cargar.
+    """Consulta por SSH si el pipeline está vivo, si cargó, y trae su traza.
 
     running: el PID del PID file sigue vivo (o hay un proceso suelto).
     ready: ya cargó Whisper y está esperando "Hola Otto" (banner en el log).
+    trace: últimas PIPELINE_TAIL_LINES líneas del stdout, sin colores.
+
+    Va todo en UN solo SSH a propósito: son tres preguntas al mismo robot y
+    abrir tres sesiones costaría tres round-trips por cada ciclo del watcher.
     """
     command = (
         f"if [ -f {OTTO_PIPELINE_PID} ] && kill -0 \"$(cat {OTTO_PIPELINE_PID} 2>/dev/null)\" 2>/dev/null; "
         f"then echo running; "
         f"elif pgrep -f '{OTTO_PIPELINE_PKILL_PATTERN}' >/dev/null 2>&1; then echo running; "
         f"else echo stopped; fi; "
-        f"grep -q HIBERNACION {OTTO_PIPELINE_LOG} 2>/dev/null && echo ready || echo loading"
+        f"grep -q HIBERNACION {OTTO_PIPELINE_LOG} 2>/dev/null && echo ready || echo loading; "
+        f"echo '---TRAZA---'; "
+        f"tail -n {PIPELINE_TAIL_LINES} {OTTO_PIPELINE_LOG} 2>/dev/null || true"
     )
-    out = run_ssh(command, timeout=8).stdout
-    running = "running" in out
-    return {"running": running, "ready": running and "ready" in out}
+    out = run_ssh(command, timeout=15).stdout
+    cabecera, _, traza = out.partition("---TRAZA---")
+    running = "running" in cabecera
+    lineas = [strip_ansi(line) for line in traza.strip("\n").splitlines()]
+    nota = ""
+    if running and not lineas:
+        # El pipeline corre pero no hay log: alguien lo levantó a mano en una
+        # terminal del robot y su stdout va a esa terminal, no a este archivo.
+        nota = (
+            "El pipeline está corriendo pero sin log: se levantó a mano en una "
+            "terminal del robot. Para ver la traza acá, arrancalo con el botón "
+            "\u201cHola Otto\u201d."
+        )
+    return {"running": running, "ready": running and "ready" in cabecera,
+            "trace": lineas, "note": nota}
 
 
 def _pipeline_watcher() -> None:
@@ -721,10 +795,15 @@ def _pipeline_watcher() -> None:
         try:
             value = query_otto_pipeline_status()
         except Exception:
-            value = {"running": False, "ready": False}
+            value = {"running": False, "ready": False, "trace": [], "note": ""}
+        trace = value.pop("trace", [])
+        note = value.pop("note", "")
         with LOCK:
             PIPELINE_STATUS.update(value)
-        time.sleep(PIPELINE_POLL_SECS)
+            PIPELINE_TRACE["lines"] = trace
+            PIPELINE_TRACE["note"] = note
+            activo = PIPELINE_STATUS["running"]
+        time.sleep(PIPELINE_POLL_SECS_ACTIVO if activo else PIPELINE_POLL_SECS)
 
 
 def start_otto_pipeline() -> None:
@@ -739,6 +818,10 @@ def start_otto_pipeline() -> None:
     run_ssh(command, timeout=20)
     with LOCK:
         PIPELINE_STATUS.update({"running": True, "ready": False})
+        # El comando redirige con `>`, o sea que trunca el log: la traza vieja
+        # ya no existe en el robot y mostrarla acá sería mentir.
+        PIPELINE_TRACE["lines"] = []
+        PIPELINE_TRACE["note"] = ""
     log("Pipeline de Hola Otto lanzado. Tarda ~20s en cargar Whisper antes de escuchar.")
 
 
@@ -787,6 +870,18 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 items = list(STATE.get("presets") or [])
             send_json(self, 200, {"ok": True, "presets": items})
+            return
+        if parsed.path == "/api/pipeline-log":
+            # Endpoint aparte de /api/status a proposito: son ~400 lineas y
+            # /api/status se pollea cada 1.5s desde el celular. La web pide esto
+            # solo mientras la pestana Registro esta abierta.
+            with LOCK:
+                lines = list(PIPELINE_TRACE["lines"])
+                note = PIPELINE_TRACE["note"]
+                running = bool(PIPELINE_STATUS["running"])
+                ready = bool(PIPELINE_STATUS["ready"])
+            send_json(self, 200, {"ok": True, "running": running, "ready": ready,
+                                  "note": note, "lines": lines})
             return
         if parsed.path == "/api/status":
             with LOCK:

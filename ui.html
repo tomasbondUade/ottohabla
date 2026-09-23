@@ -208,6 +208,7 @@
     }
     button.secondary { color: var(--ink); background: var(--panel-2); border-color: var(--line); }
     button.ghost { color: var(--muted); background: transparent; border-color: var(--line); min-height: 34px; padding: 4px 10px; font-size: 12.5px; flex: none; }
+    button.ghost[aria-selected="true"] { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
     button:disabled { opacity: .45; cursor: wait; }
     button:active:not(:disabled) { transform: translateY(1px); }
 
@@ -292,6 +293,29 @@
       font: 11.5px/1.5 ui-monospace, Consolas, monospace;
       -webkit-overflow-scrolling: touch;
     }
+
+    /* ── Terminal del Registro ──────────────────────────────────
+       Ocupa todo el alto disponible del panel en vez de un 60vh fijo: es el
+       lugar donde se sigue paso a paso qué está haciendo Otto, y con 12 líneas
+       visibles no se podía leer nada. La resta descuenta header, tabs, dock,
+       el título del panel y los botones de fuente. */
+    pre.term {
+      max-height: none;
+      height: calc(100vh - var(--header-h) - var(--tabs-h) - var(--dock-h) - 118px);
+      min-height: 260px;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    /* Mismos tags que imprime otto_pipeline en la terminal del robot. El
+       backend saca los colores ANSI (strip_ansi) y acá se recolorean. */
+    pre.term .l-stt  { color: #7fd6f5; }
+    pre.term .l-llm  { color: #f2d06b; }
+    pre.term .l-tts  { color: #b79bff; }
+    pre.term .l-ok   { color: #7fe0a0; }
+    pre.term .l-warn { color: #ffa96b; }
+    pre.term .l-dim  { color: #8595a1; }
+    pre.term .l-bold { color: #ffffff; font-weight: 600; }
+    .logsrc { display: flex; gap: 6px; }
 
     /* ── Conexión / QR ──────────────────────────────────────── */
     .qr-wrap { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
@@ -402,8 +426,16 @@
 
     <!-- ── REGISTRO ───────────────────────────────────────── -->
     <section class="panel" data-panel="registro">
-      <div class="panel-head"><h2>Registro</h2></div>
-      <pre id="log"></pre>
+      <div class="panel-head">
+        <h2>Registro</h2>
+        <div class="logsrc">
+          <button id="srcPipe" class="ghost" aria-selected="true">Hola Otto (robot)</button>
+          <button id="srcWeb" class="ghost" aria-selected="false">Servidor web</button>
+        </div>
+      </div>
+      <pre id="pipeLog" class="term"></pre>
+      <pre id="log" class="term" hidden></pre>
+      <p id="logHint" class="hint"></p>
     </section>
 
     <!-- ── CONEXIÓN ───────────────────────────────────────── -->
@@ -453,6 +485,8 @@
     const $ = (id) => document.getElementById(id);
     let micOpen = false;
     let pipelineRunning = false;
+    let registroAbierto = false;
+    let logSource = "pipe";
     let busy = false;
     let presets = [];
 
@@ -461,8 +495,75 @@
       for (const b of $("tabs").children) b.setAttribute("aria-selected", String(b.dataset.tab === name));
       for (const p of document.querySelectorAll(".panel")) p.classList.toggle("active", p.dataset.panel === name);
       document.querySelector("main").scrollTop = 0;
+      // La traza del robot son ~400 líneas por SSH: sólo se pide mientras la
+      // pestaña está a la vista, no todo el tiempo desde el celular.
+      registroAbierto = name === "registro";
+      if (registroAbierto && logSource === "pipe") refreshPipeLog();
     }
     for (const b of $("tabs").children) b.onclick = () => showTab(b.dataset.tab);
+
+    /* ── Registro: traza del robot vs. log del servidor web ─── */
+    function setLogSource(src) {
+      logSource = src;
+      $("srcPipe").setAttribute("aria-selected", String(src === "pipe"));
+      $("srcWeb").setAttribute("aria-selected", String(src === "web"));
+      $("pipeLog").hidden = src !== "pipe";
+      $("log").hidden = src !== "web";
+      $("logHint").textContent = src === "pipe"
+        ? ""
+        : "Lo que registra el servidor web de la notebook: micrófono manual, botonera, GPT.";
+      if (src === "pipe" && registroAbierto) refreshPipeLog();
+    }
+    $("srcPipe").onclick = () => setLogSource("pipe");
+    $("srcWeb").onclick = () => setLogSource("web");
+
+    // Mismos tags que otto_pipeline imprime en la terminal del robot. El
+    // backend le saca los colores ANSI y acá se recolorean, así la web se lee
+    // igual que la terminal cuando se levanta el pipeline a mano.
+    const LOG_CLASES = [
+      [/^\s*\[(STT|WHISPER)\]/, "l-stt"],
+      [/^\s*\[LLM\]/, "l-llm"],
+      [/^\s*\[TTS\]/, "l-tts"],
+      [/^\s*\[(OTTO|OK|MIC|VAD)\]/, "l-ok"],
+      [/^\s*\[ERROR\]/, "l-warn"],
+      [/^\s*\[(TIEMPO|FILTRO|◯)\]/, "l-dim"],
+      [/^\s*\[●\]/, "l-bold"],
+      [/^\s*[╔╚╗╝║═─]/, "l-bold"],
+    ];
+
+    function pintarTerminal(pre, lines) {
+      // Se preserva la posición de scroll si el usuario subió a leer algo: la
+      // terminal sólo se autoscrollea si ya estaba abajo.
+      const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
+      const frag = document.createDocumentFragment();
+      for (const line of lines) {
+        const span = document.createElement("span");
+        for (const [re, cls] of LOG_CLASES) {
+          if (re.test(line)) { span.className = cls; break; }
+        }
+        span.textContent = line + "\n";
+        frag.append(span);
+      }
+      pre.replaceChildren(frag);
+      if (atBottom) pre.scrollTop = pre.scrollHeight;
+    }
+
+    async function refreshPipeLog() {
+      try {
+        const data = await (await fetch("/api/pipeline-log")).json();
+        const lines = data.lines || [];
+        if (!lines.length) {
+          pintarTerminal($("pipeLog"), [data.running
+            ? "Pipeline corriendo, todavía sin salida…"
+            : "El pipeline de Hola Otto no está corriendo. Arrancalo con el botón del dock."]);
+        } else {
+          pintarTerminal($("pipeLog"), lines);
+        }
+        $("logHint").textContent = data.note || "";
+      } catch (err) {
+        $("logHint").textContent = "No se pudo leer la traza del robot.";
+      }
+    }
 
     /* ── Estado global ────────────────────────────────────── */
     function setBusy(value) {
@@ -723,10 +824,7 @@
         }
         if (!$("answer").classList.contains("err")) $("answer").textContent = data.last_answer || "";
 
-        const log = $("log");
-        const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
-        log.textContent = data.logs.join("\n");
-        if (atBottom) log.scrollTop = log.scrollHeight;
+        pintarTerminal($("log"), data.logs || []);
       } catch (err) {
         const pill = $("busyPill");
         pill.querySelector(".txt").textContent = "Sin conexión";
@@ -735,9 +833,13 @@
     }
 
     paintMic(false);
+    setLogSource("pipe");
     refresh();
     loadPresets(true);
     setInterval(refresh, 1500);
+    // El backend relee el log del robot cada 2s mientras el pipeline corre;
+    // pedirlo más seguido que eso no muestra nada nuevo.
+    setInterval(() => { if (registroAbierto && logSource === "pipe") refreshPipeLog(); }, 2000);
   </script>
 </body>
 </html>
