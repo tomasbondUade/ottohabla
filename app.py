@@ -285,6 +285,59 @@ def ask_and_speak(prompt: str, volume: str, instructions: str, model: str) -> st
     return answer
 
 
+# ── Modelo local del robot (Ollama en GPU) ───────────────────────────────────
+# No necesita que otto_pipeline esté corriendo: el contenedor ollama-jc escucha
+# en 0.0.0.0:11434, así que se le pega HTTP directo desde la notebook.
+OLLAMA_PORT = 11434
+OLLAMA_MODEL = "otto-llama3"
+
+
+def robot_ip() -> str:
+    """Solo la IP del robot: robot_host() devuelve 'usuario@ip'."""
+    host = robot_host()
+    return host.split("@", 1)[1] if "@" in host else host
+
+
+def ask_local_model(prompt: str, timeout: float = 180) -> str:
+    import urllib.error
+    import urllib.request
+
+    url = f"http://{robot_ip()}:{OLLAMA_PORT}/api/generate"
+    # keep_alive: -1 => el modelo queda residente en la GPU para siempre.
+    # Sin esto, Ollama lo descarga a los 5 minutos de inactividad y la
+    # siguiente pregunta paga ~47s de recarga (4.7GB a la GPU) en vez de ~3s.
+    # Medido el 2026-09-23: 51s en frío vs 3.7s en caliente.
+    body = json.dumps(
+        {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "keep_alive": -1}
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"No pude hablar con el modelo local en {url}: {exc}. "
+            "Revisá que el contenedor ollama-jc esté corriendo en el robot "
+            "(no sobrevive a un reinicio)."
+        ) from exc
+    answer = (data.get("response") or "").strip()
+    if not answer:
+        raise RuntimeError("El modelo local devolvió una respuesta vacía.")
+    return answer
+
+
+def ask_local_and_speak(prompt: str, volume: str) -> str:
+    log(f"LOCAL <= {prompt}")
+    set_phase("Pensando (local)")
+    answer = ask_local_model(prompt)
+    log(f"LOCAL => {answer}")
+    set_phase("Hablando")
+    speak(answer, volume)
+    return answer
+
+
 def robot_host() -> str:
     with LOCK:
         return str(STATE.get("robot_host") or "unitree@10.42.0.164")
@@ -575,6 +628,26 @@ def stop_mic() -> str:
         MIC["thread"] = None
         MIC["remote_wav"] = ""
 
+    # ORDEN IMPORTANTE (bug 2026-09-23): primero se corta el grabador REMOTO y se
+    # espera a que termine de salir, y recién después se mata el ssh local y se
+    # copia el WAV. Al revés había una carrera: `parecord` escribe los tamaños
+    # del header del WAV al cerrarse, así que copiar antes de que termine traía
+    # un WAV con header inválido y OpenAI lo rechazaba con "Unrecognized file
+    # format" (el archivo en el robot quedaba bien unos instantes después, lo
+    # que hacía el síntoma confuso).
+    # El grabador de Python sale DESPUÉS de parecord (lo espera con wait()), así
+    # que esperar a que desaparezca garantiza que el WAV quedó cerrado.
+    run_checked(
+        ssh_command(
+            robot_host(),
+            robot_key(),
+            f"pkill -f '{REMOTE_MIC_PKILL_PATTERN}' || true; "
+            f"for _ in $(seq 1 40); do "
+            f"pgrep -f '{REMOTE_MIC_PKILL_PATTERN}' >/dev/null 2>&1 || break; sleep 0.25; done",
+        ),
+        timeout=20,
+    )
+
     if isinstance(proc, subprocess.Popen):
         proc.terminate()
         try:
@@ -584,14 +657,6 @@ def stop_mic() -> str:
                     log(line)
         except subprocess.TimeoutExpired:
             proc.kill()
-    run_checked(
-        ssh_command(
-            robot_host(),
-            robot_key(),
-            f"pkill -f '{REMOTE_MIC_PKILL_PATTERN}' || true",
-        ),
-        timeout=10,
-    )
     if isinstance(thread, threading.Thread):
         thread.join(timeout=1)
 
@@ -847,6 +912,18 @@ class Handler(BaseHTTPRequestHandler):
                     STATE["last_user"] = preset["label"]
                     STATE["last_answer"] = text
                 send_json(self, 200, {"ok": True, "text": text})
+                return
+
+            if parsed.path == "/api/text-local":
+                start_busy_action()
+                text = (payload.get("text") or "").strip()
+                if not text:
+                    raise ValueError("Texto vacio.")
+                answer = ask_local_and_speak(text, payload.get("volume") or "alto")
+                with LOCK:
+                    STATE["last_user"] = text
+                    STATE["last_answer"] = answer
+                send_json(self, 200, {"ok": True, "answer": answer})
                 return
 
             if parsed.path == "/api/text":

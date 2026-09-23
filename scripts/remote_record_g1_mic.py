@@ -66,11 +66,15 @@ def main() -> int:
 
     def stop(_signum, _frame) -> None:
         # SIGINT (no SIGTERM/kill) para que parecord cierre el WAV prolijo
-        # en vez de dejarlo truncado/corrupto.
+        # en vez de dejarlo truncado/corrupto: escribe los tamaños del header
+        # al cerrarse, y un WAV sin eso lo rechazan los transcriptores.
         proc.send_signal(signal.SIGINT)
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    # SIGHUP también: si se corta la sesión SSH de golpe, igual queremos que el
+    # WAV quede cerrado y usable en vez de a medio escribir.
+    signal.signal(signal.SIGHUP, stop)
 
     proc.wait()
     print(f"recorded_ok={proc.returncode == 0}", flush=True)

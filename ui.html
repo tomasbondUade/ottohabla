@@ -386,13 +386,15 @@
 
     <!-- ── HABLAR ─────────────────────────────────────────── -->
     <section class="panel" data-panel="hablar">
-      <div class="panel-head"><h2>Hablar con GPT</h2></div>
+      <div class="panel-head"><h2>Hablar</h2></div>
       <label for="prompt">Texto para Otto</label>
       <textarea id="prompt">Presentate como Otto en una frase corta.</textarea>
       <div class="actions">
-        <button id="sendText">Enviar y hablar</button>
+        <button id="sendText">Enviar a GPT</button>
+        <button id="sendTextLocal">Enviar al modelo local</button>
         <button id="toPreset" class="secondary">Guardar como audio</button>
       </div>
+      <p class="hint">GPT usa la API de OpenAI (necesita internet). El modelo local corre en la GPU del robot (<code>otto-llama3</code>, sin internet) — tarda más, pero es el mismo modelo que usa "Hola Otto".</p>
       <label>Última respuesta</label>
       <p id="heard" class="heard"></p>
       <div id="answer" class="answer"></div>
@@ -620,6 +622,14 @@
       });
     }
 
+    // Mismo texto, pero contra el modelo local del robot (Ollama en GPU) en vez
+    // de OpenAI. No necesita internet ni que "Hola Otto" esté corriendo.
+    async function sendTextLocal() {
+      const text = $("prompt").value.trim();
+      if (!text) return showError("Escribí algo primero.");
+      await api("/api/text-local", { text, volume: $("volume").value });
+    }
+
     // Puente entre las dos secciones: el texto se lleva al formulario de creación
     // en vez de duplicar acá la lógica de guardado.
     $("toPreset").onclick = () => {
@@ -666,6 +676,7 @@
 
     /* ── Config ───────────────────────────────────────────── */
     $("sendText").onclick = sendText;
+    $("sendTextLocal").onclick = sendTextLocal;
     $("saveKey").onclick = async () => {
       await api("/api/key", { api_key: $("apiKey").value });
       $("apiKey").value = "";
