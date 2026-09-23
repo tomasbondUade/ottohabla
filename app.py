@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import collections
 import json
 import os
 import html
@@ -166,7 +167,7 @@ PIPELINE_STATUS = {"running": False, "ready": False}
 # [STT], [LLM], [TTS], [TIEMPO], [FILTRO], los cambios de estado. La pestana
 # Registro de la web la muestra tal cual para poder seguir cada paso sin
 # tener que abrir un SSH.
-PIPELINE_TRACE = {"lines": [], "note": ""}
+PIPELINE_TRACE = {"lines": collections.deque(maxlen=400), "conectado": False}
 PIPELINE_TAIL_LINES = 400
 # Dos ritmos: si el pipeline esta corriendo se pollea seguido para que el
 # Registro se sienta como la terminal del robot; si esta parado no hay nada
@@ -749,39 +750,76 @@ def strip_ansi(text: str) -> str:
 
 
 def query_otto_pipeline_status() -> dict:
-    """Consulta por SSH si el pipeline está vivo, si cargó, y trae su traza.
+    """Consulta por SSH si el pipeline está vivo y si ya terminó de cargar.
 
     running: el PID del PID file sigue vivo (o hay un proceso suelto).
     ready: ya cargó Whisper y está esperando "Hola Otto" (banner en el log).
-    trace: últimas PIPELINE_TAIL_LINES líneas del stdout, sin colores.
 
-    Va todo en UN solo SSH a propósito: son tres preguntas al mismo robot y
-    abrir tres sesiones costaría tres round-trips por cada ciclo del watcher.
+    El log NO viaja por acá. Antes este mismo SSH traía un `tail -n 400` en cada
+    ciclo, y el Registro de la web quedaba 2-4s atrasado: el watcher preguntaba
+    cada 2s y el navegador preguntaba cada 2s, con los dos relojes sin
+    sincronizar, así que los atrasos se sumaban. Ahora las líneas llegan
+    empujadas por un `tail -F` permanente (ver _tail_supervisor).
     """
     command = (
         f"if [ -f {OTTO_PIPELINE_PID} ] && kill -0 \"$(cat {OTTO_PIPELINE_PID} 2>/dev/null)\" 2>/dev/null; "
         f"then echo running; "
         f"elif pgrep -f '{OTTO_PIPELINE_PKILL_PATTERN}' >/dev/null 2>&1; then echo running; "
         f"else echo stopped; fi; "
-        f"grep -q HIBERNACION {OTTO_PIPELINE_LOG} 2>/dev/null && echo ready || echo loading; "
-        f"echo '---TRAZA---'; "
-        f"tail -n {PIPELINE_TAIL_LINES} {OTTO_PIPELINE_LOG} 2>/dev/null || true"
+        f"grep -q HIBERNACION {OTTO_PIPELINE_LOG} 2>/dev/null && echo ready || echo loading"
     )
-    out = run_ssh(command, timeout=15).stdout
-    cabecera, _, traza = out.partition("---TRAZA---")
-    running = "running" in cabecera
-    lineas = [strip_ansi(line) for line in traza.strip("\n").splitlines()]
-    nota = ""
-    if running and not lineas:
-        # El pipeline corre pero no hay log: alguien lo levantó a mano en una
-        # terminal del robot y su stdout va a esa terminal, no a este archivo.
-        nota = (
-            "El pipeline está corriendo pero sin log: se levantó a mano en una "
-            "terminal del robot. Para ver la traza acá, arrancalo con el botón "
-            "\u201cHola Otto\u201d."
-        )
-    return {"running": running, "ready": running and "ready" in cabecera,
-            "trace": lineas, "note": nota}
+    out = run_ssh(command, timeout=10).stdout
+    running = "running" in out
+    return {"running": running, "ready": running and "ready" in out}
+
+
+def _tail_supervisor() -> None:
+    """Mantiene vivo un `tail -F` del log del pipeline sobre un SSH permanente.
+
+    Empujar en vez de pollear: las líneas llegan en cuanto el pipeline las
+    imprime, así el único atraso que queda es el refresco del navegador.
+
+    `tail -F` (mayúscula) sigue el archivo POR NOMBRE, así que aguanta las dos
+    cosas que le pasan a este log: que todavía no exista (el pipeline no
+    arrancó) y que se trunque (start_otto_pipeline redirige con `>`). Cuando el
+    SSH se corta -- robot reiniciado, AP caído -- se vuelve a levantar solo.
+    """
+    while True:
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                ssh_command(
+                    robot_host(),
+                    robot_key(),
+                    f"tail -n {PIPELINE_TAIL_LINES} -F {OTTO_PIPELINE_LOG}",
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+            with LOCK:
+                PIPELINE_TRACE["conectado"] = True
+            assert proc.stdout is not None
+            for raw in proc.stdout:
+                linea = strip_ansi(raw.rstrip("\n"))
+                # Los avisos de tail ("file truncated", "has appeared") no son
+                # salida de Otto: ensucian la terminal de la web.
+                if linea.startswith("tail:"):
+                    continue
+                with LOCK:
+                    PIPELINE_TRACE["lines"].append(linea)
+        except Exception:
+            pass
+        finally:
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            with LOCK:
+                PIPELINE_TRACE["conectado"] = False
+        time.sleep(3.0)
 
 
 def _pipeline_watcher() -> None:
@@ -795,13 +833,9 @@ def _pipeline_watcher() -> None:
         try:
             value = query_otto_pipeline_status()
         except Exception:
-            value = {"running": False, "ready": False, "trace": [], "note": ""}
-        trace = value.pop("trace", [])
-        note = value.pop("note", "")
+            value = {"running": False, "ready": False}
         with LOCK:
             PIPELINE_STATUS.update(value)
-            PIPELINE_TRACE["lines"] = trace
-            PIPELINE_TRACE["note"] = note
             activo = PIPELINE_STATUS["running"]
         time.sleep(PIPELINE_POLL_SECS_ACTIVO if activo else PIPELINE_POLL_SECS)
 
@@ -820,8 +854,7 @@ def start_otto_pipeline() -> None:
         PIPELINE_STATUS.update({"running": True, "ready": False})
         # El comando redirige con `>`, o sea que trunca el log: la traza vieja
         # ya no existe en el robot y mostrarla acá sería mentir.
-        PIPELINE_TRACE["lines"] = []
-        PIPELINE_TRACE["note"] = ""
+        PIPELINE_TRACE["lines"].clear()
     log("Pipeline de Hola Otto lanzado. Tarda ~20s en cargar Whisper antes de escuchar.")
 
 
@@ -877,9 +910,18 @@ class Handler(BaseHTTPRequestHandler):
             # solo mientras la pestana Registro esta abierta.
             with LOCK:
                 lines = list(PIPELINE_TRACE["lines"])
-                note = PIPELINE_TRACE["note"]
+                conectado = bool(PIPELINE_TRACE["conectado"])
                 running = bool(PIPELINE_STATUS["running"])
                 ready = bool(PIPELINE_STATUS["ready"])
+            note = ""
+            if running and not lines:
+                # Corre pero no hay log: se levantó a mano en una terminal del
+                # robot y su stdout va a esa terminal, no a este archivo.
+                note = ("El pipeline está corriendo pero sin log: se levantó a mano "
+                        "en una terminal del robot. Para ver la traza acá, "
+                        "arrancalo con el botón \u201cHola Otto\u201d.")
+            elif not conectado:
+                note = "Sin conexión con el log del robot, reintentando…"
             send_json(self, 200, {"ok": True, "running": running, "ready": ready,
                                   "note": note, "lines": lines})
             return
@@ -1151,6 +1193,7 @@ def main() -> int:
     server = ThreadingHTTPServer((host, port), Handler)
     server.daemon_threads = True
     threading.Thread(target=_pipeline_watcher, daemon=True).start()
+    threading.Thread(target=_tail_supervisor, daemon=True).start()
     log(f"OttoHabla listo en http://{host}:{port}")
     try:
         server.serve_forever()

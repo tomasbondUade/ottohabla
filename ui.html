@@ -837,9 +837,10 @@
     refresh();
     loadPresets(true);
     setInterval(refresh, 1500);
-    // El backend relee el log del robot cada 2s mientras el pipeline corre;
-    // pedirlo más seguido que eso no muestra nada nuevo.
-    setInterval(() => { if (registroAbierto && logSource === "pipe") refreshPipeLog(); }, 2000);
+    // El backend ya no pollea el robot: las líneas le llegan empujadas por un
+    // `tail -F` permanente, así que leerlas es leer memoria. Por eso acá se
+    // puede refrescar cada 1s sin costo, y el atraso total baja de 2-4s a ~1s.
+    setInterval(() => { if (registroAbierto && logSource === "pipe") refreshPipeLog(); }, 1000);
   </script>
 </body>
 </html>
