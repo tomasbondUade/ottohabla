@@ -5,6 +5,7 @@
 #   otto_preset.sh play <nombre> [bajo|medio|alto|max]
 #   otto_preset.sh list                      # JSON a stdout
 #   otto_preset.sh delete <nombre>
+#   otto_preset.sh beep abrir|cerrar         # pip corto por el parlante
 #
 # Los audios maestros se guardan SIN ganancia (16k mono s16). El volumen se
 # aplica al reproducir, igual que otto_say.sh, y se cachea en /tmp.
@@ -88,6 +89,47 @@ cmd_play() {
   "$SPEAK" "$IFACE" "$boosted" "$SDK_VOL"
 }
 
+# Pip corto por el parlante del robot, para marcar cuándo se abre y cuándo se
+# cierra el micrófono manual de la web. Es el gemelo de otto_beep() de
+# otto_pipeline.cpp (880Hz, 250ms, fades de 20ms para que no chasquee), que ya
+# hace esto en la vía de "Hola Otto"; acá se replica con ffmpeg porque no hay
+# ningún binario que genere tonos.
+#
+# Dos tonos distintos a propósito: agudo = "ya podés hablar", grave = "cerré,
+# estoy procesando". Un solo tono para las dos cosas no informa nada.
+#
+# El WAV se genera una vez y queda en caché: son 250ms de una senoidal, no tiene
+# sentido re-sintetizarlo en cada apertura de micrófono.
+cmd_beep() {
+  local cual="${1:-abrir}" freq dur
+  case "$cual" in
+    abrir)  freq=880 ; dur=0.25 ;;
+    cerrar) freq=620 ; dur=0.25 ;;
+    *) die "Uso: otto_preset.sh beep {abrir|cerrar}" ;;
+  esac
+
+  [ -x "$SPEAK" ] || die "No encuentro otto_speak_file en $SPEAK"
+  mkdir -p "$CACHE_DIR"
+  local wav="$CACHE_DIR/beep_${cual}.wav"
+  if [ ! -f "$wav" ]; then
+    # volume=7.8 NO es arbitrario: el `sine` de ffmpeg genera a 0.125 de escala
+    # (-18 dBFS), no a escala completa, así que sin amplificar el pip sale
+    # inaudible (medido: pico 0.06). 0.125 x 7.8 = 0.975, que es la misma
+    # amplitud que usa otto_beep() en otto_pipeline.cpp (32000/32768 = 0.977),
+    # para que el pip de la web suene igual al de "Hola Otto".
+    local fin
+    fin=$(python3 -c "print(round($dur - 0.02, 3))")
+    ffmpeg -y -f lavfi -i "sine=frequency=${freq}:duration=${dur}:sample_rate=16000" \
+      -af "volume=7.8,afade=t=in:d=0.02,afade=t=out:st=${fin}:d=0.02" \
+      -ac 1 -sample_fmt s16 "$wav" -loglevel quiet \
+      || die "ffmpeg falló al generar el pip."
+  fi
+
+  # Volumen SDK 100, igual que otto_beep(): el pip tiene que oírse por encima
+  # del ruido de una sala, no al nivel de una respuesta hablada.
+  "$SPEAK" "$IFACE" "$wav" 100
+}
+
 cmd_delete() {
   local name="${1:-}"
   check_name "$name"
@@ -129,5 +171,6 @@ case "${1:-}" in
   play)   shift; cmd_play   "$@" ;;
   list)   shift; cmd_list   "$@" ;;
   delete) shift; cmd_delete "$@" ;;
-  *) die "Uso: otto_preset.sh {save <n> [--force] | play <n> [vol] | list | delete <n>}" ;;
+  beep)   shift; cmd_beep   "$@" ;;
+  *) die "Uso: otto_preset.sh {save <n> [--force] | play <n> [vol] | list | delete <n> | beep abrir|cerrar}" ;;
 esac

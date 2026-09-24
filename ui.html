@@ -23,10 +23,14 @@
       --ok-bg: #eef8f2;
       --ok-line: #b8dec7;
       --radius: 12px;
-      --tap: 46px;
+      /* Blanco de toque. La guía de accesibilidad pide 44px como MÍNIMO; acá se
+         usa bastante más porque esto se maneja de parado, con el robot en la
+         mano y mirando a la persona que pregunta, no sentado mirando la
+         pantalla. */
+      --tap: 58px;
       --header-h: 44px;
       --tabs-h: 46px;
-      --dock-h: 58px;
+      --dock-h: 72px;
     }
     @media (prefers-color-scheme: dark) {
       :root {
@@ -196,10 +200,10 @@
     button {
       min-height: var(--tap);
       border: 1px solid transparent;
-      border-radius: 10px;
-      padding: 10px 14px;
+      border-radius: 12px;
+      padding: 12px 16px;
       font: inherit;
-      font-size: 14.5px;
+      font-size: 16px;
       font-weight: 650;
       color: var(--accent-ink);
       background: var(--accent);
@@ -207,7 +211,7 @@
       touch-action: manipulation;
     }
     button.secondary { color: var(--ink); background: var(--panel-2); border-color: var(--line); }
-    button.ghost { color: var(--muted); background: transparent; border-color: var(--line); min-height: 34px; padding: 4px 10px; font-size: 12.5px; flex: none; }
+    button.ghost { color: var(--muted); background: transparent; border-color: var(--line); min-height: 40px; padding: 6px 12px; font-size: 13.5px; flex: none; }
     button.ghost[aria-selected="true"] { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
     button:disabled { opacity: .45; cursor: wait; }
     button:active:not(:disabled) { transform: translateY(1px); }
@@ -217,23 +221,25 @@
     @media (min-width: 640px) { .split { grid-template-columns: minmax(0, 260px) minmax(0, 1fr); align-items: start; } }
 
     /* ── Grilla de audios ───────────────────────────────────── */
-    .presets { display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 8px; }
+    /* minmax 148px -> 168px: con 148 entraban dos columnas muy angostas en un
+       celular de 390px y el nombre del audio quedaba cortado. */
+    .presets { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 10px; }
     .preset {
       position: relative;
       display: flex;
       flex-direction: column;
       justify-content: center;
-      gap: 2px;
-      min-height: 56px;
+      gap: 3px;
+      min-height: 76px;
       text-align: left;
       color: var(--ink);
       background: var(--panel);
       border-color: var(--line);
       overflow: hidden;
     }
-    .preset .nm { font-size: 14px; font-weight: 650; }
+    .preset .nm { font-size: 16.5px; font-weight: 650; }
     .preset .tx {
-      font-size: 11.5px;
+      font-size: 12.5px;
       font-weight: 400;
       color: var(--muted);
       white-space: nowrap;
@@ -244,7 +250,7 @@
     .preset .del {
       position: absolute;
       top: 0; right: 0; bottom: 0;
-      width: 42px;
+      width: 52px;
       min-height: 0;
       border: 0;
       border-left: 1px solid var(--line);
@@ -255,7 +261,7 @@
       padding: 0;
     }
     body:not(.editing) .preset .del { display: none; }
-    body.editing .preset { padding-right: 50px; }
+    body.editing .preset { padding-right: 60px; }
     .empty {
       padding: 22px 14px;
       text-align: center;
@@ -343,9 +349,11 @@
       border-top: 1px solid var(--line);
       background: var(--panel);
     }
-    .dock #micBtn { flex: 1; min-height: 42px; }
-    .dock #pipelineBtn { flex: 1; min-height: 42px; }
-    .dock select { width: auto; min-width: 96px; min-height: 42px; font-size: 14px; padding: 6px 10px; flex: none; }
+    .dock #micBtn { flex: 1; min-height: 56px; font-size: 16.5px; }
+    .dock #pipelineBtn { flex: 1; min-height: 56px; font-size: 16.5px; }
+    /* El selector de volumen se achica a propósito: es lo que menos se toca del
+       dock y le tiene que dejar el ancho a los dos botones. */
+    .dock select { width: auto; min-width: 86px; min-height: 56px; font-size: 15px; padding: 6px 10px; flex: none; }
     #micBtn.rec { background: var(--danger); color: #fff; }
     /* Pipeline de "Hola Otto": amarillo mientras carga Whisper (~20s), verde ya escuchando. */
     #pipelineBtn.loading { background: var(--warn, #b8860b); color: #fff; }

@@ -291,7 +291,9 @@ def cancel_robot_voice() -> str:
 def ask_and_speak(prompt: str, volume: str, instructions: str, model: str) -> str:
     log(f"GPT <= {prompt}")
     set_phase("Pensando")
-    answer = ask_gpt(prompt, model, instructions).strip()
+    # Mismo saneo que la via local: GPT tambien mete markdown de vez en cuando,
+    # y todo esto termina en Piper.
+    answer = limpiar_para_voz(ask_gpt(prompt, model, instructions).strip())
     log(f"GPT => {answer}")
     set_phase("Hablando")
     speak(answer, volume)
@@ -344,7 +346,7 @@ def ask_local_model(prompt: str, timeout: float = 180) -> str:
 def ask_local_and_speak(prompt: str, volume: str) -> str:
     log(f"LOCAL <= {prompt}")
     set_phase("Pensando (local)")
-    answer = ask_local_model(prompt)
+    answer = limpiar_para_voz(ask_local_model(prompt))
     log(f"LOCAL => {answer}")
     set_phase("Hablando")
     speak(answer, volume)
@@ -437,6 +439,20 @@ def run_remote_preset(*args: str, input_text: str | None = None, timeout: float 
     return run_ssh(command, input_text=input_text, timeout=timeout).stdout.strip()
 
 
+def beep(cual: str) -> None:
+    """Pip por el parlante del robot: "abrir" (agudo) o "cerrar" (grave).
+
+    Envuelto en try/except a proposito: el pip es una senial de cortesia, no
+    parte del trabajo. Si el parlante no responde o el SSH tarda, el microfono
+    se tiene que abrir igual -- quedarse sin grabar porque no se pudo hacer un
+    ruido seria absurdo. Falla en silencio hacia el usuario y queda en el log.
+    """
+    try:
+        run_remote_preset("beep", cual, timeout=15)
+    except Exception as exc:
+        log(f"No pude reproducir el pip de {cual}: {exc}")
+
+
 def refresh_presets() -> list[dict]:
     raw = run_remote_preset("list", timeout=20)
     items = json.loads(raw or "[]")
@@ -525,6 +541,34 @@ UADE_VARIANTES = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+
+
+# Markdown que Piper leeria en voz alta. Gemela de limpiar_para_voz() en
+# ottoguide-ia/src/otto_audio/cpp/otto_pipeline.cpp: el modelo local ignora el
+# "PROHIBIDO usar listas" del Modelfile bastante seguido, y por la via de "Hola
+# Otto" eso ya se sanea. Por la via de la web (boton "Enviar al modelo local")
+# la respuesta cruda iba derecho a Piper, que lee los asteriscos, los corchetes
+# y el "mailto" como si fueran palabras.
+MD_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")   # [texto](url) -> texto
+MD_LINK_SUELTO_RE = re.compile(r"\[([^\]]*)\]")       # [texto] -> texto
+MD_VINETA_RE = re.compile(r"(?m)^[ \t]*(?:[-*+]\s+|\d+[.)]\s*)")
+MD_MARCAS_RE = re.compile(r"[*_`#]")
+
+
+def limpiar_para_voz(text: str) -> str:
+    """Saca el markdown de una respuesta antes de mandarla a Piper.
+
+    Todo lo que devuelve esta funcion se convierte en voz: un asterisco o una
+    vineta suenan como ruido, y un link markdown se lee entero ("corchete
+    ingreso arroba uade punto edu punto ar corchete parentesis mailto...").
+    """
+    out = MD_LINK_RE.sub(r"\1", text)
+    out = MD_LINK_SUELTO_RE.sub(r"\1", out)
+    out = MD_VINETA_RE.sub("", out)
+    out = MD_MARCAS_RE.sub("", out)
+    # Saltos de linea -> espacio: es una sola tirada de voz, no un texto.
+    out = out.replace("\r", " ").replace("\n", " ")
+    return " ".join(out.split())
 
 
 def corregir_uade(text: str) -> str:
@@ -657,6 +701,13 @@ def start_mic(min_confidence: float = 0.55) -> None:
         MIC["proc"] = proc
         MIC["thread"] = None
         MIC["remote_wav"] = remote_wav
+    # El pip va DESPUES de arrancar el grabador, no antes: marca "desde ACA te
+    # estoy grabando". Si fuera antes, la persona empezaria a hablar durante el
+    # ~1s que tarda en levantarse el grabador y se perderian las primeras
+    # palabras. Como contrapartida el pip queda grabado al inicio del WAV, que
+    # es inofensivo: son 250ms de un tono puro, no de habla (el otto_beep() de
+    # "Hola Otto" tiene exactamente la misma propiedad).
+    beep("abrir")
     log("Microfono abierto. Grabando audio crudo del G1; cerralo cuando termines.")
 
 
@@ -704,6 +755,10 @@ def stop_mic() -> str:
     if isinstance(thread, threading.Thread):
         thread.join(timeout=1)
 
+    # Pip de cierre con el grabador ya muerto: no se graba a si mismo, y suena
+    # justo cuando empieza la espera (copiar el WAV + transcribir), que es lo
+    # que tiene que comunicar: "listo, te escuche, ahora estoy procesando".
+    beep("cerrar")
     log("Microfono cerrado.")
     with tempfile.TemporaryDirectory() as temp_dir:
         local_wav = Path(temp_dir) / "g1_mic.wav"
