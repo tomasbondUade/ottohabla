@@ -70,7 +70,7 @@ STATE = {
     "robot_ok": False,
     "presets": [],
     "contexts": [],
-    "context_active": "",
+    "context_active": [],
 }
 EVENT_CONTEXT = (
     "Sos Otto-Man, robot anfitrion de 'El Nuevo Mapa del Capital' en UADE. "
@@ -507,12 +507,12 @@ def run_remote_context(*args: str, input_text: str | None = None, timeout: float
 
 def refresh_contexts() -> dict:
     raw = run_remote_context("list", timeout=20)
-    data = json.loads(raw or '{"active": "", "contexts": []}')
+    data = json.loads(raw or '{"active": [], "contexts": []}')
     if not isinstance(data, dict):
         raise RuntimeError("El robot devolvio un listado de contextos invalido.")
     with LOCK:
         STATE["contexts"] = data.get("contexts") or []
-        STATE["context_active"] = data.get("active") or ""
+        STATE["context_active"] = data.get("active") or []
     return data
 
 
@@ -1066,18 +1066,28 @@ class Handler(BaseHTTPRequestHandler):
                 # Si ademas lo pidieron activo, se activa en la misma llamada:
                 # guardar y despues tener que tocar otro boton es el paso que
                 # uno se olvida justo en medio de un evento.
+                # Se SUMA a los que ya estaban activos en vez de reemplazarlos:
+                # activar "ingreso" no deberia apagar "general" sin avisar.
                 if payload.get("activate"):
-                    run_remote_context("set-active", name, timeout=15)
-                    log(f"Contexto '{name}' activado.")
+                    actuales = [n for n in run_remote_context("active", timeout=15).splitlines() if n]
+                    if name not in actuales:
+                        actuales.append(name)
+                    run_remote_context("set-active", *actuales, timeout=15)
+                    log(f"Contextos activos: {', '.join(actuales)}")
                 send_json(self, 200, {"ok": True, **refresh_contexts()})
                 return
 
             if parsed.path == "/api/context-activate":
-                raw = (payload.get("name") or "").strip()
-                # Vacio = ninguno: Otto vuelve a contestar solo con el Modelfile.
-                name = validate_context_name(raw) if raw else "-"
-                activo = run_remote_context("set-active", name, timeout=15)
-                log(f"Contexto activo: {activo}")
+                # Llega la lista COMPLETA de los que tienen que quedar activos,
+                # no un delta: asi la web es la duenia del estado y no hay forma
+                # de que se desincronicen si dos celulares tocan a la vez.
+                crudos = payload.get("names")
+                if not isinstance(crudos, list):
+                    raise ValueError("Falta la lista de contextos a activar.")
+                nombres = [validate_context_name(n) for n in crudos if str(n).strip()]
+                # Lista vacia = ninguno: Otto vuelve a contestar solo con el Modelfile.
+                activos = run_remote_context("set-active", *(nombres or ["-"]), timeout=15)
+                log(f"Contextos activos: {activos.replace(chr(10), ', ')}")
                 send_json(self, 200, {"ok": True, **refresh_contexts()})
                 return
 

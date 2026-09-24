@@ -285,6 +285,7 @@
     .answer.err { color: var(--danger); border-color: var(--danger-line); background: var(--danger-bg); }
     .heard { margin: 0 0 8px; font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
     .heard b { color: var(--ink); font-weight: 600; }
+    .err-txt { color: var(--danger); }
     pre {
       margin: 0;
       padding: 10px;
@@ -322,6 +323,31 @@
     pre.term .l-dim  { color: #8595a1; }
     pre.term .l-bold { color: #ffffff; font-weight: 600; }
     .logsrc { display: flex; gap: 6px; }
+
+    /* Interruptor de cada contexto. Va pegado al borde derecho del tile, como
+       la X de borrar de los audios: tocar el resto del tile lo trae al editor,
+       tocar acá lo prende o lo apaga. Son dos acciones muy distintas y no
+       pueden compartir el mismo blanco. */
+    .preset .sw {
+      position: absolute;
+      top: 0; right: 0; bottom: 0;
+      width: 44px;
+      min-height: 0;
+      border: 0;
+      border-left: 1px solid var(--line);
+      border-radius: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 19px;
+      line-height: 1;
+    }
+    .preset.on .sw { color: var(--ok); }
+    .preset.on { border-color: var(--ok); }
+    .ctx-tile { padding-right: 52px; }
+    /* Los nombres de contexto son más largos que los de audio y con dos
+       columnas se partían en dos líneas. Una sola columna hasta 560px. */
+    #ctxList { grid-template-columns: 1fr; }
+    @media (min-width: 560px) { #ctxList { grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); } }
 
     /* ── Conexión / QR ──────────────────────────────────────── */
     .qr-wrap { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
@@ -440,9 +466,11 @@
         <button id="reloadContexts" class="ghost">Actualizar</button>
       </div>
       <p class="hint" style="margin-top:0">
-        Lo que Otto <b>sabe</b>. Se aplica en la pregunta siguiente, sin reiniciar nada.
+        Lo que Otto <b>sabe</b>. Tocá el <b>○</b> para prender o apagar cada uno;
+        se pueden tener varios activos. Se aplica en la pregunta siguiente.
       </p>
       <div id="ctxList" class="presets"></div>
+      <p id="ctxResumen" class="hint"></p>
       <div id="ctxNone" class="empty" hidden>
         Todavía no hay contextos. Escribí uno abajo y guardalo.
       </div>
@@ -456,10 +484,11 @@
         <button id="ctxDeactivate" class="secondary">Desactivar todos</button>
       </div>
       <p class="hint">
-        Un toque en un contexto lo trae al editor; no lo activa. Sin ninguno
-        activo, Otto contesta sólo con lo que trae el modelo. La
-        <b>personalidad</b> y las reglas de cómo habla no se tocan desde acá:
-        eso vive en el Modelfile.
+        Un toque en el contexto lo trae al editor; no lo activa. Conviene tener
+        varios chicos por tema (general, ingreso, posgrados) y prender sólo los
+        que el evento necesita: todo junto no entra cómodo en la ventana del
+        modelo. La <b>personalidad</b> y las reglas de cómo habla no se tocan
+        desde acá: eso vive en el Modelfile.
       </p>
     </section>
 
@@ -694,7 +723,7 @@
 
     /* ── Contexto ─────────────────────────────────────────── */
     let contexts = [];
-    let contextActive = "";
+    let contextActive = [];
 
     function renderContexts() {
       const grid = $("ctxList");
@@ -702,29 +731,55 @@
       $("ctxNone").hidden = contexts.length > 0;
       for (const c of contexts) {
         const b = document.createElement("button");
-        b.className = "preset" + (c.active ? " playing" : "");
+        b.className = "preset ctx-tile" + (c.active ? " on" : "");
         const nm = document.createElement("span");
         nm.className = "nm";
-        nm.textContent = c.active ? c.name + "  ●" : c.name;
+        nm.textContent = c.name;
         const tx = document.createElement("span");
         tx.className = "tx";
-        tx.textContent = c.active ? "activo · " + c.bytes + " bytes" : c.bytes + " bytes";
-        b.append(nm, tx);
-        // Un toque carga el contexto en el editor. Activar y borrar son botones
-        // aparte a propósito: tocar la lista no debería cambiar lo que Otto
-        // sabe sin querer, en medio de un evento.
+        // Sin la palabra "activo": el ● del interruptor ya lo dice.
+        tx.textContent = c.bytes + " bytes";
+        // Tocar el tile lo trae al editor; NO lo activa. Cambiar lo que Otto
+        // sabe en medio de un evento no puede pasar por tocar sin querer.
         b.onclick = () => {
           $("ctxName").value = c.name;
           $("ctxText").value = c.text || "";
         };
+        const sw = document.createElement("button");
+        sw.className = "sw";
+        sw.textContent = c.active ? "●" : "○";
+        sw.title = c.active ? "Desactivar" : "Activar";
+        sw.onclick = (ev) => { ev.stopPropagation(); toggleContexto(c.name); };
+        b.append(nm, tx, sw);
         grid.append(b);
       }
+      const activos = contexts.filter((c) => c.active).length;
+      const bytes = contexts.filter((c) => c.active).reduce((a, c) => a + c.bytes, 0);
+      // Se muestra el total porque es lo que decide si entra en la ventana del
+      // modelo: arriba de ~12000 bytes Otto empieza a olvidarse de sus reglas.
+      $("ctxResumen").textContent = activos
+        ? `${activos} activo${activos > 1 ? "s" : ""} · ${bytes} bytes en total`
+        : "Ninguno activo: Otto contesta sólo con lo que trae el modelo.";
+      $("ctxResumen").className = bytes > 12000 ? "hint err-txt" : "hint";
     }
 
     function applyContexts(data) {
       contexts = data.contexts || [];
-      contextActive = data.active || "";
+      contextActive = data.active || [];
       renderContexts();
+    }
+
+    // Se manda la lista COMPLETA y no un delta: la web es la dueña del estado,
+    // así no hay forma de desincronizarse si dos celulares tocan a la vez.
+    async function toggleContexto(name) {
+      const names = contexts.filter((c) => c.active).map((c) => c.name);
+      const i = names.indexOf(name);
+      if (i >= 0) names.splice(i, 1); else names.push(name);
+      try {
+        applyContexts(await post("/api/context-activate", { names }));
+      } catch (err) {
+        showError(err.message);
+      }
     }
 
     async function loadContexts() {
@@ -752,7 +807,7 @@
     $("ctxSaveActivate").onclick = () => guardarContexto(true);
     $("ctxDeactivate").onclick = async () => {
       try {
-        applyContexts(await post("/api/context-activate", { name: "" }));
+        applyContexts(await post("/api/context-activate", { names: [] }));
       } catch (err) {
         showError(err.message);
       }
