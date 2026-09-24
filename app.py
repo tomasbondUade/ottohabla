@@ -28,6 +28,11 @@ API_KEY_FILE = ROOT / ".ottohabla_api_key"
 UI_FILE = ROOT / "ui.html"
 REMOTE_PRESET_DIR = "/home/unitree/Desktop/presets_ottohabla"
 REMOTE_PRESET_SCRIPT = f"{REMOTE_PRESET_DIR}/otto_preset.sh"
+# Contextos: el "qué sabe" Otto, editable sin rebuildear el modelo. El contenido
+# vive SOLO en el robot (nunca en git): son datos de la universidad que cambian
+# por su cuenta y que se editan desde el celular en medio de un evento.
+REMOTE_CONTEXT_DIR = "/home/unitree/Desktop/contextos_otto"
+REMOTE_CONTEXT_SCRIPT = f"{REMOTE_CONTEXT_DIR}/otto_context.sh"
 PRESET_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,40}$")
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
@@ -64,6 +69,8 @@ STATE = {
     "robot_host": os.getenv("OTTOHABLA_G1_HOST", "unitree@10.42.0.164"),
     "robot_ok": False,
     "presets": [],
+    "contexts": [],
+    "context_active": "",
 }
 EVENT_CONTEXT = (
     "Sos Otto-Man, robot anfitrion de 'El Nuevo Mapa del Capital' en UADE. "
@@ -461,6 +468,52 @@ def refresh_presets() -> list[dict]:
     with LOCK:
         STATE["presets"] = items
     return items
+
+
+def validate_context_name(name: str) -> str:
+    name = (name or "").strip()
+    if not PRESET_NAME_RE.match(name):
+        raise ValueError("Nombre invalido. Usa solo letras, numeros, - y _ (hasta 40).")
+    # Reservado: es el nombre del symlink que apunta al contexto activo.
+    if name == "activo":
+        raise ValueError("'activo' es un nombre reservado, elegi otro.")
+    return name
+
+
+def ensure_remote_context_script() -> None:
+    """Sube otto_context.sh al robot si cambio. Mismo patron que los presets."""
+    source = (SCRIPTS / "otto_context.sh").read_text(encoding="utf-8")
+    local_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    check = run_ssh(
+        f"sha256sum {shlex.quote(REMOTE_CONTEXT_SCRIPT)} 2>/dev/null | awk '{{print $1}}' || true",
+        timeout=10,
+    )
+    if check.stdout.strip() == local_hash:
+        return
+    command = (
+        f"mkdir -p {shlex.quote(REMOTE_CONTEXT_DIR)} && "
+        f"cat > {shlex.quote(REMOTE_CONTEXT_SCRIPT)} && "
+        f"chmod 700 {shlex.quote(REMOTE_CONTEXT_SCRIPT)}"
+    )
+    run_ssh(command, input_text=source, timeout=20)
+    log("Script de contextos instalado/actualizado en el robot.")
+
+
+def run_remote_context(*args: str, input_text: str | None = None, timeout: float = 30) -> str:
+    ensure_remote_context_script()
+    command = " ".join([shlex.quote(REMOTE_CONTEXT_SCRIPT), *(shlex.quote(v) for v in args)])
+    return run_ssh(command, input_text=input_text, timeout=timeout).stdout.strip()
+
+
+def refresh_contexts() -> dict:
+    raw = run_remote_context("list", timeout=20)
+    data = json.loads(raw or '{"active": "", "contexts": []}')
+    if not isinstance(data, dict):
+        raise RuntimeError("El robot devolvio un listado de contextos invalido.")
+    with LOCK:
+        STATE["contexts"] = data.get("contexts") or []
+        STATE["context_active"] = data.get("active") or ""
+    return data
 
 
 def render_ui() -> bytes:
@@ -996,6 +1049,44 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             payload = get_json(self)
+
+            # ── Contextos (el "que sabe" Otto) ──────────────────────────
+            if parsed.path == "/api/contexts-refresh":
+                data = refresh_contexts()
+                send_json(self, 200, {"ok": True, **data})
+                return
+
+            if parsed.path == "/api/context-save":
+                name = validate_context_name(payload.get("name") or "")
+                text = (payload.get("text") or "").strip()
+                if not text:
+                    raise ValueError("El contexto esta vacio.")
+                run_remote_context("save", name, input_text=text, timeout=25)
+                log(f"Contexto '{name}' guardado ({len(text)} caracteres).")
+                # Si ademas lo pidieron activo, se activa en la misma llamada:
+                # guardar y despues tener que tocar otro boton es el paso que
+                # uno se olvida justo en medio de un evento.
+                if payload.get("activate"):
+                    run_remote_context("set-active", name, timeout=15)
+                    log(f"Contexto '{name}' activado.")
+                send_json(self, 200, {"ok": True, **refresh_contexts()})
+                return
+
+            if parsed.path == "/api/context-activate":
+                raw = (payload.get("name") or "").strip()
+                # Vacio = ninguno: Otto vuelve a contestar solo con el Modelfile.
+                name = validate_context_name(raw) if raw else "-"
+                activo = run_remote_context("set-active", name, timeout=15)
+                log(f"Contexto activo: {activo}")
+                send_json(self, 200, {"ok": True, **refresh_contexts()})
+                return
+
+            if parsed.path == "/api/context-delete":
+                name = validate_context_name(payload.get("name") or "")
+                run_remote_context("delete", name, timeout=15)
+                log(f"Contexto '{name}' borrado.")
+                send_json(self, 200, {"ok": True, **refresh_contexts()})
+                return
 
             if parsed.path == "/api/presets-refresh":
                 items = refresh_presets()

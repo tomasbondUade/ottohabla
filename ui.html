@@ -374,6 +374,7 @@
     <button data-tab="audios" aria-selected="true">Audios</button>
     <button data-tab="crear">Crear</button>
     <button data-tab="hablar">Hablar</button>
+    <button data-tab="contexto">Contexto</button>
     <button data-tab="registro">Registro</button>
     <button data-tab="conexion">Conexión</button>
     <button data-tab="config">Config</button>
@@ -430,6 +431,36 @@
       <label>Última respuesta</label>
       <p id="heard" class="heard"></p>
       <div id="answer" class="answer"></div>
+    </section>
+
+    <!-- ── CONTEXTO ───────────────────────────────────────── -->
+    <section class="panel" data-panel="contexto">
+      <div class="panel-head">
+        <h2>Contexto</h2>
+        <button id="reloadContexts" class="ghost">Actualizar</button>
+      </div>
+      <p class="hint" style="margin-top:0">
+        Lo que Otto <b>sabe</b>. Se aplica en la pregunta siguiente, sin reiniciar nada.
+      </p>
+      <div id="ctxList" class="presets"></div>
+      <div id="ctxNone" class="empty" hidden>
+        Todavía no hay contextos. Escribí uno abajo y guardalo.
+      </div>
+      <label for="ctxName">Nombre</label>
+      <input id="ctxName" placeholder="uade-general" autocapitalize="off" autocorrect="off" spellcheck="false" />
+      <label for="ctxText">Datos que Otto tiene que saber</label>
+      <textarea id="ctxText" rows="6" placeholder="Sede Monserrat: Lima 757, CABA.&#10;Bedelía atiende de 9 a 20.&#10;Becas: escribir a ingreso@uade.edu.ar."></textarea>
+      <div class="actions">
+        <button id="ctxSave">Guardar</button>
+        <button id="ctxSaveActivate">Guardar y activar</button>
+        <button id="ctxDeactivate" class="secondary">Desactivar todos</button>
+      </div>
+      <p class="hint">
+        Un toque en un contexto lo trae al editor; no lo activa. Sin ninguno
+        activo, Otto contesta sólo con lo que trae el modelo. La
+        <b>personalidad</b> y las reglas de cómo habla no se tocan desde acá:
+        eso vive en el Modelfile.
+      </p>
     </section>
 
     <!-- ── REGISTRO ───────────────────────────────────────── -->
@@ -507,6 +538,9 @@
       // pestaña está a la vista, no todo el tiempo desde el celular.
       registroAbierto = name === "registro";
       if (registroAbierto && logSource === "pipe") refreshPipeLog();
+      // Los contextos se piden al abrir la pestaña, no al arrancar: es un SSH
+      // al robot y la mayoría de las veces nadie va a tocar el contexto.
+      if (name === "contexto" && !contexts.length) loadContexts();
     }
     for (const b of $("tabs").children) b.onclick = () => showTab(b.dataset.tab);
 
@@ -657,6 +691,72 @@
         grid.append(button);
       }
     }
+
+    /* ── Contexto ─────────────────────────────────────────── */
+    let contexts = [];
+    let contextActive = "";
+
+    function renderContexts() {
+      const grid = $("ctxList");
+      grid.replaceChildren();
+      $("ctxNone").hidden = contexts.length > 0;
+      for (const c of contexts) {
+        const b = document.createElement("button");
+        b.className = "preset" + (c.active ? " playing" : "");
+        const nm = document.createElement("span");
+        nm.className = "nm";
+        nm.textContent = c.active ? c.name + "  ●" : c.name;
+        const tx = document.createElement("span");
+        tx.className = "tx";
+        tx.textContent = c.active ? "activo · " + c.bytes + " bytes" : c.bytes + " bytes";
+        b.append(nm, tx);
+        // Un toque carga el contexto en el editor. Activar y borrar son botones
+        // aparte a propósito: tocar la lista no debería cambiar lo que Otto
+        // sabe sin querer, en medio de un evento.
+        b.onclick = () => {
+          $("ctxName").value = c.name;
+          $("ctxText").value = c.text || "";
+        };
+        grid.append(b);
+      }
+    }
+
+    function applyContexts(data) {
+      contexts = data.contexts || [];
+      contextActive = data.active || "";
+      renderContexts();
+    }
+
+    async function loadContexts() {
+      try {
+        applyContexts(await post("/api/contexts-refresh"));
+      } catch (err) {
+        showError("No pude leer los contextos del robot: " + err.message);
+      }
+    }
+
+    $("reloadContexts").onclick = loadContexts;
+
+    async function guardarContexto(activar) {
+      const name = $("ctxName").value.trim();
+      const text = $("ctxText").value.trim();
+      if (!name) return showError("Ponele un nombre al contexto.");
+      if (!text) return showError("El contexto está vacío.");
+      try {
+        applyContexts(await post("/api/context-save", { name, text, activate: activar }));
+      } catch (err) {
+        showError(err.message);
+      }
+    }
+    $("ctxSave").onclick = () => guardarContexto(false);
+    $("ctxSaveActivate").onclick = () => guardarContexto(true);
+    $("ctxDeactivate").onclick = async () => {
+      try {
+        applyContexts(await post("/api/context-activate", { name: "" }));
+      } catch (err) {
+        showError(err.message);
+      }
+    };
 
     async function loadPresets(refreshRemote = false) {
       try {
