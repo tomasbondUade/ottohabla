@@ -26,17 +26,13 @@ ROOT = Path(__file__).resolve().parent
 SCRIPTS = ROOT / "scripts"
 API_KEY_FILE = ROOT / ".ottohabla_api_key"
 UI_FILE = ROOT / "ui.html"
-REMOTE_PRESET_DIR = "/home/unitree/Desktop/presets_ottohabla"
-REMOTE_PRESET_SCRIPT = f"{REMOTE_PRESET_DIR}/otto_preset.sh"
-# Contextos: el "qué sabe" Otto, editable sin rebuildear el modelo. El contenido
-# vive SOLO en el robot (nunca en git): son datos de la universidad que cambian
-# por su cuenta y que se editan desde el celular en medio de un evento.
-REMOTE_CONTEXT_DIR = "/home/unitree/Desktop/contextos_otto"
-REMOTE_CONTEXT_SCRIPT = f"{REMOTE_CONTEXT_DIR}/otto_context.sh"
 PRESET_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,40}$")
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+# Estos imports van DESPUES del sys.path.insert de arriba: los modulos viven en
+# scripts/, no al lado de app.py.
+import otto_config
 from ask_gpt_and_speak import (
     DEFAULT_G1_HOST,
     DEFAULT_G1_KEY,
@@ -48,6 +44,16 @@ from ask_gpt_and_speak import (
     split_text_for_speech,
 )
 from listen_g1_gpt import extract_asr_text, listen_once, ssh_command
+
+# Rutas dentro del robot. Salen de otto_config, que las toma del entorno con el
+# valor de siempre como fallback (ver scripts/otto_config.py).
+REMOTE_PRESET_DIR = otto_config.PRESETS_DIR
+REMOTE_PRESET_SCRIPT = f"{REMOTE_PRESET_DIR}/otto_preset.sh"
+# Contextos: el "qué sabe" Otto, editable sin rebuildear el modelo. El contenido
+# vive SOLO en el robot (nunca en git): son datos de la universidad que cambian
+# por su cuenta y que se editan desde el celular en medio de un evento.
+REMOTE_CONTEXT_DIR = otto_config.CONTEXTS_DIR
+REMOTE_CONTEXT_SCRIPT = f"{REMOTE_CONTEXT_DIR}/otto_context.sh"
 
 
 def load_api_key() -> bool:
@@ -274,7 +280,7 @@ def speech_preview(text: str) -> str:
 
 
 def cancel_robot_voice() -> str:
-    speak_file = "/home/unitree/Desktop/teo_Ottoguide_IA/ottoguide-ia/src/otto_audio/cpp/build/otto_speak_file"
+    speak_file = otto_config.SPEAK_FILE
     command = (
         "killall -q -TERM piper ffmpeg aplay paplay otto_say.sh otto_speak otto_speak_file || true; "
         "sleep 0.2; "
@@ -310,8 +316,8 @@ def ask_and_speak(prompt: str, volume: str, instructions: str, model: str) -> st
 # ── Modelo local del robot (Ollama en GPU) ───────────────────────────────────
 # No necesita que otto_pipeline esté corriendo: el contenedor ollama-jc escucha
 # en 0.0.0.0:11434, así que se le pega HTTP directo desde la notebook.
-OLLAMA_PORT = 11434
-OLLAMA_MODEL = "otto-llama3"
+OLLAMA_PORT = otto_config.OLLAMA_PORT
+OLLAMA_MODEL = otto_config.OLLAMA_MODEL
 
 
 def robot_ip() -> str:
@@ -442,7 +448,17 @@ def ensure_remote_preset_script() -> None:
 
 def run_remote_preset(*args: str, input_text: str | None = None, timeout: float = 90) -> str:
     ensure_remote_preset_script()
-    command = " ".join([shlex.quote(REMOTE_PRESET_SCRIPT), *(shlex.quote(value) for value in args)])
+    # La ruta del binario viaja en el comando en vez de estar escrita adentro del
+    # script: así hay UN solo lugar donde cambiarla (config/robot.conf), aunque
+    # el script corra del otro lado del SSH. El script igual trae su default,
+    # para cuando se lo invoca a mano para depurar.
+    entorno = (
+        f"OTTO_G1_SPEAK_FILE={shlex.quote(otto_config.SPEAK_FILE)} "
+        f"OTTO_G1_SDK_IFACE={shlex.quote(otto_config.G1_SDK_IFACE)} "
+    )
+    command = entorno + " ".join(
+        [shlex.quote(REMOTE_PRESET_SCRIPT), *(shlex.quote(value) for value in args)]
+    )
     return run_ssh(command, input_text=input_text, timeout=timeout).stdout.strip()
 
 
@@ -833,9 +849,7 @@ def stop_mic() -> str:
 # ── Pipeline de wake word ("Hola Otto") corriendo en el robot ────────────────
 # Rutas fijas en el robot (ver SHPR-Ottoman-FAIN/ARQUITECTURA.md, "Constantes
 # compartidas"). El binario lo compila ottoguide-ia en el robot.
-OTTO_PIPELINE_BIN = (
-    "/home/unitree/Desktop/teo_Ottoguide_IA/ottoguide-ia/src/otto_audio/cpp/build/otto_pipeline"
-)
+OTTO_PIPELINE_BIN = otto_config.PIPELINE_BIN
 OTTO_PIPELINE_PID = "/tmp/otto_pipeline.pid"
 OTTO_PIPELINE_LOG = "/tmp/otto_pipeline.log"
 # Patrón con el truco del corchete, igual que REMOTE_MIC_PKILL_PATTERN: solo se
@@ -1317,7 +1331,7 @@ class Handler(BaseHTTPRequestHandler):
                     instructions = payload.get("instructions") or EVENT_CONTEXT
                     g1_host = robot_host()
                     g1_identity_file = DEFAULT_G1_KEY
-                    asr_bin = "~/Desktop/teo_Ottoguide_IA/ottoguide-ia/src/otto_audio/cpp/build/asr_test"
+                    asr_bin = otto_config.ASR_BIN
                     asr_interface = "eth0"
                     otto_say = DEFAULT_OTTO_SAY
                     otto_volume = payload.get("volume") or "alto"

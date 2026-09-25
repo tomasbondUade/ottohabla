@@ -15,8 +15,11 @@ PRESETS_DIR="$HOME/Desktop/presets_ottohabla"
 CACHE_DIR="/tmp/otto_preset_cache"
 PIPER="$HOME/piper/piper"
 VOICE="$HOME/piper/voices/es_MX-gevy-high.onnx"
-SPEAK="$HOME/Desktop/teo_Ottoguide_IA/ottoguide-ia/src/otto_audio/cpp/build/otto_speak_file"
-IFACE="eth0"
+# La ruta la manda app.py en el comando SSH (sale de config/robot.conf). El
+# default es el valor de siempre: este script también se corre a mano por SSH
+# para depurar, y ahí no hay ninguna variable puesta.
+SPEAK="${OTTO_G1_SPEAK_FILE:-$HOME/Desktop/teo_Ottoguide_IA/ottoguide-ia/src/otto_audio/cpp/build/otto_speak_file}"
+IFACE="${OTTO_G1_SDK_IFACE:-eth0}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 

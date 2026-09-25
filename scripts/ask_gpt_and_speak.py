@@ -12,12 +12,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import otto_config
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = "gpt-5.6"
 DEFAULT_G1_HOST = "unitree@192.168.123.164"
 DEFAULT_G1_KEY = Path.home() / ".ssh" / "ottohabla_g1"
-DEFAULT_OTTO_SAY = "/home/unitree/Desktop/teo_Ottoguide_IA/ottoguide-ia/src/otto_audio/scripts/otto_say.sh"
+DEFAULT_OTTO_SAY = otto_config.SPEAK_FILE
 SSH_MUX_OPTS = [
     "-o",
     "ControlMaster=auto",

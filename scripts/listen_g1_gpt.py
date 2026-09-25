@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 
+import otto_config
 from ask_gpt_and_speak import (
     DEFAULT_G1_HOST,
     DEFAULT_G1_KEY,
@@ -20,7 +21,7 @@ from ask_gpt_and_speak import (
 )
 
 
-ASR_BIN = "~/Desktop/teo_Ottoguide_IA/ottoguide-ia/src/otto_audio/cpp/build/asr_test"
+ASR_BIN = otto_config.ASR_BIN
 
 
 def parse_args() -> argparse.Namespace:

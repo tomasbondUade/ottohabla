@@ -11,9 +11,11 @@ import wave
 
 from play_g1_wav import REQUIRED_RATE, REQUIRED_WIDTH, apply_gain, convert_audio, wav_is_compatible
 
+import otto_config
+
 
 REMOTE_HOST = "unitree@192.168.123.164"
-REMOTE_BIN = "/home/unitree/Desktop/teo_Ottoguide_IA/ottoguide-ia/src/otto_audio/cpp/build/otto_speak_file"
+REMOTE_BIN = otto_config.SPEAK_FILE
 REMOTE_DIR = "/tmp/ottohabla_audio"
 DEFAULT_KEY = Path.home() / ".ssh" / "ottohabla_g1"
 
