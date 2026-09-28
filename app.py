@@ -326,7 +326,37 @@ def robot_ip() -> str:
     return host.split("@", 1)[1] if "@" in host else host
 
 
-def ask_local_model(prompt: str, timeout: float = 180) -> str:
+# Corte de oraciones para hablar de a poco. Los mismos números que
+# ollama_query_stream() en otto_pipeline.cpp, y a propósito: si las dos vías
+# cortan distinto, Otto suena distinto según de dónde venga la pregunta.
+#   MIN: no mandarle a Piper fragmentos de dos palabras, que suenan cortados.
+#   MAX: válvula de escape para una respuesta sin puntuación.
+#   MAX_ORACIONES: el modelo ignora el "MÁXIMO 2 oraciones" del Modelfile
+#     (comprobado tres veces), así que el tope va en el código. Medido el
+#     2026-09-28: una respuesta de 413 caracteres son ~31s de habla; cortar en 2
+#     oraciones es el ahorro más grande de todo el camino, más que la generación.
+MIN_ORACION = 40
+MAX_ORACION = 220
+MAX_ORACIONES = 2
+FIN_ORACION = (".", "!", "?")
+
+
+def stream_local_model(prompt: str, on_oracion, max_oraciones: int = MAX_ORACIONES,
+                       timeout: float = 180) -> str:
+    """Lee la respuesta de Ollama token por token y va entregando oraciones.
+
+    Antes se pedía con stream=False y se esperaba la respuesta ENTERA antes de
+    hablar: ~11s de silencio a 9,2 tok/s (medido 2026-09-28), contra ~2,8s por la
+    vía de "Hola Otto", que ya streameaba. El total no baja -- el cuello es la
+    generación -- pero la espera hasta la primera palabra se derrumba.
+
+    Al llegar a `max_oraciones` se corta la conexión, y eso NO es sólo ahorrar
+    lectura: Ollama ve el cliente desconectado y abandona la generación, así que
+    tampoco se pagan los tokens que igual no se iban a decir.
+
+    @INPUT: prompt; on_oracion = se invoca con cada oración completa
+    @OUTPUT: el texto que efectivamente se entregó (para loguear y mostrar)
+    """
     import urllib.error
     import urllib.request
 
@@ -336,33 +366,87 @@ def ask_local_model(prompt: str, timeout: float = 180) -> str:
     # siguiente pregunta paga ~47s de recarga (4.7GB a la GPU) en vez de ~3s.
     # Medido el 2026-09-23: 51s en frío vs 3.7s en caliente.
     body = json.dumps(
-        {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "keep_alive": -1}
+        {"model": OLLAMA_MODEL, "prompt": prompt, "stream": True, "keep_alive": -1}
     ).encode("utf-8")
     request = urllib.request.Request(
         url, data=body, headers={"Content-Type": "application/json"}, method="POST"
     )
+
+    completa: list[str] = []
+    oracion = ""
+    dichas = 0
+
+    def soltar() -> int:
+        nonlocal oracion, dichas
+        if not oracion.strip():
+            oracion = ""
+            return dichas
+        completa.append(oracion.strip())
+        on_oracion(oracion.strip())
+        oracion = ""
+        dichas += 1
+        return dichas
+
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
+            # NDJSON: un objeto por línea.
+            for cruda in response:
+                linea = cruda.decode("utf-8", errors="replace").strip()
+                if not linea:
+                    continue
+                try:
+                    trozo = json.loads(linea)
+                except json.JSONDecodeError:
+                    continue
+                texto = trozo.get("response") or ""
+                if texto:
+                    oracion += texto
+                    corta = oracion.rstrip()
+                    if ((corta.endswith(FIN_ORACION) and len(corta) >= MIN_ORACION)
+                            or len(corta) >= MAX_ORACION):
+                        if soltar() >= max_oraciones:
+                            break
+                if trozo.get("done"):
+                    break
     except urllib.error.URLError as exc:
         raise RuntimeError(
             f"No pude hablar con el modelo local en {url}: {exc}. "
             "Revisá que el contenedor ollama-jc esté corriendo en el robot "
-            "(no sobrevive a un reinicio)."
+            "(arrancalo con SHPR-Ottoman-FAIN/net/ollama-on.sh)."
         ) from exc
-    answer = (data.get("response") or "").strip()
-    if not answer:
-        raise RuntimeError("El modelo local devolvió una respuesta vacía.")
-    return answer
+
+    # Lo que quedó sin punto final, sólo si no llegamos al tope: pasado el tope
+    # ya se dijo lo que había que decir y el resto se descarta a propósito.
+    if dichas < max_oraciones:
+        soltar()
+
+    return " ".join(completa)
 
 
 def ask_local_and_speak(prompt: str, volume: str) -> str:
     log(f"LOCAL <= {prompt}")
     set_phase("Pensando (local)")
-    answer = limpiar_para_voz(ask_local_model(prompt))
-    log(f"LOCAL => {answer}")
-    set_phase("Hablando")
-    speak(answer, volume)
+    arranque = time.time()
+    dichas: list[str] = []
+
+    def decir(frase: str) -> None:
+        limpia = limpiar_para_voz(frase)
+        if not limpia:
+            return
+        if not dichas:
+            # El tiempo hasta la PRIMERA palabra es lo que se percibe como
+            # "tarda"; el total importa mucho menos. Por eso se loguea aparte.
+            log(f"LOCAL => primera oracion a los {time.time() - arranque:.1f}s")
+            set_phase("Hablando")
+        dichas.append(limpia)
+        log(f"LOCAL => {limpia}")
+        speak(limpia, volume)
+
+    stream_local_model(prompt, decir)
+    if not dichas:
+        raise RuntimeError("El modelo local devolvió una respuesta vacía.")
+    answer = " ".join(dichas)
+    log(f"LOCAL => completo en {time.time() - arranque:.1f}s ({len(answer)} chars)")
     return answer
 
 
