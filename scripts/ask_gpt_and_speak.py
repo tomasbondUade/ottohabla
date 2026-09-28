@@ -19,7 +19,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = "gpt-5.6"
 DEFAULT_G1_HOST = "unitree@192.168.123.164"
 DEFAULT_G1_KEY = Path.home() / ".ssh" / "ottohabla_g1"
-DEFAULT_OTTO_SAY = otto_config.SPEAK_FILE
+# otto_say.sh (texto -> Piper -> parlante), NO otto_speak_file (que espera un WAV
+# ya generado). Ver la nota en otto_config.py.
+DEFAULT_OTTO_SAY = otto_config.OTTO_SAY
 SSH_MUX_OPTS = [
     "-o",
     "ControlMaster=auto",

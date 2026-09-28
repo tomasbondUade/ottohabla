@@ -42,7 +42,16 @@ G1_OTTOGUIDE = _env("OTTOHABLA_G1_OTTOGUIDE", f"{G1_HOME}/Desktop/teo_Ottoguide_
 G1_BUILD = _env("OTTOHABLA_G1_BUILD", f"{G1_OTTOGUIDE}/src/otto_audio/cpp/build")
 
 # Binarios compilados en el robot.
+#
+# OJO, SPEAK_FILE y OTTO_SAY NO son intercambiables y confundirlos no da un error
+# obvio, da un fallo raro en tiempo de ejecucion:
+#   SPEAK_FILE = otto_speak_file  -> recibe <interfaz> <archivo.wav> [volumen]
+#   OTTO_SAY   = otto_say.sh      -> recibe "<texto>" [volumen], genera el WAV
+#                                    con Piper y despues llama a SPEAK_FILE
+# El 2026-09-25 se puso SPEAK_FILE donde iba OTTO_SAY y eso dejo a la voz de GPT
+# y del modelo local invocando el binario con el texto como nombre de interfaz.
 SPEAK_FILE = _env("OTTOHABLA_G1_SPEAK_FILE", f"{G1_BUILD}/otto_speak_file")
+OTTO_SAY = _env("OTTOHABLA_G1_OTTO_SAY", f"{G1_OTTOGUIDE}/src/otto_audio/scripts/otto_say.sh")
 PIPELINE_BIN = _env("OTTOHABLA_G1_PIPELINE", f"{G1_BUILD}/otto_pipeline")
 ASR_BIN = _env("OTTOHABLA_G1_ASR", f"{G1_BUILD}/asr_test")
 
