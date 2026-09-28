@@ -1028,6 +1028,61 @@ def _tail_supervisor() -> None:
         time.sleep(3.0)
 
 
+def _precalentar_modelo() -> None:
+    """Hace una consulta de descarte para que Ollama evalúe el prompt grande.
+
+    POR QUÉ. El `SYSTEM` del Modelfile son ~6977 tokens y Ollama los evalúa la
+    PRIMERA vez que se le pregunta algo; después quedan cacheados y ni siquiera
+    se reevalúan al cambiar de pregunta. Medido el 2026-09-28 con el robot
+    recién reiniciado: la primera consulta tardó **51,5s** en dar la primera
+    oración, contra 3,1s las siguientes.
+
+    Si esa primera le toca a una persona parada frente al robot, la demo está
+    arruinada. Así que se paga acá, cuando la web arranca y no hay nadie
+    esperando.
+
+    DÓNDE. `ollama-on.sh` también precalienta, pero ese script se corre a mano.
+    Al bootear, Docker levanta el contenedor solo y nadie lo calienta -- por eso
+    hace falta también acá: levantar la web es el momento real en que empieza la
+    función.
+
+    Va en un hilo aparte y falla en silencio hacia el usuario: si el robot no
+    está todavía, el backend tiene que levantar igual. Queda en el log.
+    """
+    import urllib.error
+    import urllib.request
+
+    # Un respiro antes de arrancar: si la web sube junto con el robot, Ollama
+    # puede no estar escuchando todavía.
+    time.sleep(5.0)
+    url = f"http://{robot_ip()}:{OLLAMA_PORT}/api/generate"
+    # num_predict 1: no interesa la respuesta. Lo caro es evaluar el prompt, y
+    # con un solo token de salida el caché ya queda armado.
+    body = json.dumps({
+        "model": OLLAMA_MODEL, "prompt": "hola", "stream": False,
+        "keep_alive": -1, "options": {"num_predict": 1},
+    }).encode("utf-8")
+    for intento in (1, 2):
+        arranque = time.time()
+        try:
+            request = urllib.request.Request(
+                url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+            )
+            with urllib.request.urlopen(request, timeout=240) as respuesta:
+                respuesta.read()
+            log(f"Modelo local precalentado en {time.time() - arranque:.0f}s. "
+                "La primera pregunta va a ser rápida.")
+            return
+        except (urllib.error.URLError, OSError) as exc:
+            if intento == 1:
+                # Reintento único: el caso típico es que el robot todavía esté
+                # arrancando. Insistir más sería ruido en el log.
+                time.sleep(20.0)
+                continue
+            log(f"No pude precalentar el modelo local ({exc}). "
+                "Va a andar igual, pero la primera pregunta puede tardar ~50s.")
+
+
 def _pipeline_watcher() -> None:
     """Refresca PIPELINE_STATUS en segundo plano.
 
@@ -1448,6 +1503,7 @@ def main() -> int:
     server.daemon_threads = True
     threading.Thread(target=_pipeline_watcher, daemon=True).start()
     threading.Thread(target=_tail_supervisor, daemon=True).start()
+    threading.Thread(target=_precalentar_modelo, daemon=True).start()
     log(f"OttoHabla listo en http://{host}:{port}")
     try:
         server.serve_forever()
